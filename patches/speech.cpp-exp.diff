@@ -1,0 +1,841 @@
+diff --git a/src/common/model-file.cpp b/src/common/model-file.cpp
+index d2b1102..43c59a4 100644
+--- a/src/common/model-file.cpp
++++ b/src/common/model-file.cpp
+@@ -1,7 +1,10 @@
+ #include "model-file.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cctype>
++#include <chrono>
++#include <map>
+ #include <climits>
+ #include <cstdio>
+ #include <cstring>
+@@ -14,8 +17,85 @@
+ #include "json.h"
+ #include "log.h"
+ 
++#include <cstdlib>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
++
+ namespace {
+ 
++/** Experiment switches, read from the environment so the CLI and worker need no new flags. */
++bool env_on(const char * name) {
++    const char * v = std::getenv(name);
++    return v && *v && std::strcmp(v, "0") != 0;
++}
++
++/**
++ * Experiment (SPEECH_MMAP): maps the whole file read-only and returns the mapping, which unmaps when the last owner
++ * lets go, with its size in `size`. On POSIX, SPEECH_MADVISE=random|sequential|willneed advises the kernel.
++ */
++std::shared_ptr<void> map_read_only(const std::string & path, size_t & size) {
++#ifdef _WIN32
++    const int wide_len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
++    std::wstring wide((size_t) std::max(wide_len, 1), L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wide.data(), wide_len);
++    // No FILE_FLAG_RANDOM_ACCESS: it turns off the cache manager's read-ahead, which an expert's contiguous slices
++    // need (on Linux, MADV_RANDOM made streaming 3x slower).
++    HANDLE file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
++    if (file == INVALID_HANDLE_VALUE) throw Error(Fault::Io, "cannot open " + path + " to map it");
++    LARGE_INTEGER bytes{};
++    if (!GetFileSizeEx(file, &bytes)) {
++        CloseHandle(file);
++        throw Error(Fault::Io, "cannot read the size of " + path);
++    }
++    HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
++    CloseHandle(file);  // the mapping keeps the file open
++    if (!mapping) throw Error(Fault::Io, "cannot map " + path);
++    void * addr = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
++    CloseHandle(mapping);  // the view keeps the mapping alive
++    if (!addr) throw Error(Fault::Io, "cannot map a view of " + path);
++    size = (size_t) bytes.QuadPart;
++    // Prefetch the whole view (SPEECH_PREFETCH=0 skips it), as llama.cpp does on Windows: one large asynchronous read
++    // into the standby list instead of a page fault per 4 KiB on first use.
++    if (const char * p = std::getenv("SPEECH_PREFETCH"); !p || std::strcmp(p, "0") != 0) {
++        WIN32_MEMORY_RANGE_ENTRY range{addr, size};
++        PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
++    }
++    return std::shared_ptr<void>(addr, [](void * p) { UnmapViewOfFile(p); });
++#else
++    const int fd = ::open(path.c_str(), O_RDONLY);
++    struct stat st {};
++    if (fd < 0 || fstat(fd, &st) != 0) {
++        if (fd >= 0) ::close(fd);
++        throw Error(Fault::Io, "cannot open " + path + " to map it");
++    }
++    void * addr = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++    ::close(fd);
++    if (addr == MAP_FAILED) throw Error(Fault::Io, "cannot map " + path);
++    size = (size_t) st.st_size;
++    if (const char * advice = std::getenv("SPEECH_MADVISE")) {
++        const int a = !std::strcmp(advice, "random") ? MADV_RANDOM : !std::strcmp(advice, "sequential") ? MADV_SEQUENTIAL
++                    : !std::strcmp(advice, "willneed") ? MADV_WILLNEED : MADV_NORMAL;
++        madvise(addr, size, a);
++    }
++    const size_t mapped = size;
++    return std::shared_ptr<void>(addr, [mapped](void * p) { munmap(p, mapped); });
++#endif
++}
++
++bool is_cpu(ggml_backend_t backend) {
++    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++    return dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
++}
++
+ using Gguf = std::unique_ptr<gguf_context, decltype(&gguf_free)>;
+ 
+ /**
+@@ -222,10 +302,28 @@ void ModelFile::check_tensors(const Layout & layout) const {
+ void ModelFile::allocate(const std::function<ggml_backend_t(const std::string & name)> & place) {
+     const int64_t n = gguf_get_n_tensors(gguf_.get());
+     std::vector<ggml_backend_t> backends;
++    const bool use_mmap = env_on("SPEECH_MMAP");
++    std::unique_ptr<ggml_context, decltype(&ggml_free)> mapped_ctx(nullptr, ggml_free);
++    std::vector<std::pair<ggml_tensor *, size_t>> mapped_at;  // tensor, its offset in the file
++    if (use_mmap && !map_) map_ = map_read_only(path_, map_size_);
++    const uint64_t data_offset = gguf_get_data_offset(gguf_.get());
+     for (int64_t i = 0; i < n; i++) {
+         const char * name = gguf_get_tensor_name(gguf_.get(), i);
+         ggml_backend_t backend = place(name);
+         if (!backend) continue;
++        if (use_mmap && is_cpu(backend)) {
++            if (!mapped_ctx) {
++                ggml_init_params params = {ggml_tensor_overhead() * (size_t) n, nullptr, true};
++                mapped_ctx.reset(ggml_init(params));
++                if (!mapped_ctx) throw Error(Fault::OutOfMemory, "cannot create a ggml context for the mapped tensors of " + path_);
++            }
++            ggml_tensor * t = ggml_dup_tensor(mapped_ctx.get(), ggml_get_tensor(ctx_.get(), name));
++            ggml_set_name(t, name);
++            by_name_.emplace(name, t);
++            mapped_.insert(name);
++            mapped_at.emplace_back(t, (size_t) (data_offset + gguf_get_tensor_offset(gguf_.get(), i)));
++            continue;
++        }
+         const size_t at = (size_t) (std::find(backends.begin(), backends.end(), backend) - backends.begin());
+         if (at == backends.size()) {
+             ggml_init_params params = {ggml_tensor_overhead() * (size_t) n, nullptr, true};
+@@ -242,6 +340,22 @@ void ModelFile::allocate(const std::function<ggml_backend_t(const std::string &
+         if (!buffers_.back()) throw Error(Fault::OutOfMemory, "cannot allocate the weights of " + path_ + " on " + ggml_backend_name(backends[i]));
+         ggml_backend_buffer_set_usage(buffers_.back().get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+     }
++    if (mapped_ctx) {
++        // The CPU reads the weights in place: a host buffer over the whole mapping, each tensor at its offset in the file.
++        // PROT_READ is enough, since weights are never written; a write would fault rather than corrupt the file.
++        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(map_.get(), map_size_);
++        if (!buf) throw Error(Fault::OutOfMemory, "cannot make a buffer of the mapping of " + path_);
++        buffers_.emplace_back(buf, ggml_backend_buffer_free);
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        for (auto & [t, offset] : mapped_at) {
++            if (offset + ggml_nbytes(t) > map_size_) throw file_error("the tensor " + std::string(t->name) + " of " + path_ + " lies past its end");
++            if (ggml_backend_tensor_alloc(buf, t, (char *) map_.get() + offset) != GGML_STATUS_SUCCESS) {
++                throw Error(Fault::OutOfMemory, "cannot place the mapped tensor " + std::string(t->name));
++            }
++        }
++        kept_.push_back(std::move(mapped_ctx));
++        log_message(LogLevel::Warn, "experiment: mapped " + std::to_string(mapped_at.size()) + " tensors of " + path_ + " for the CPU\n");
++    }
+ }
+ 
+ void ModelFile::load() {
+@@ -249,22 +363,42 @@ void ModelFile::load() {
+     if (!f) throw Error(Fault::Io, "cannot open " + path_);
+     const uint64_t data_offset = gguf_get_data_offset(gguf_.get());
+     std::vector<uint8_t> piece;
++    // Experiment (SPEECH_LOAD_TIMING=1): seconds spent reading the file against setting the values, per buffer type.
++    const bool timing = env_on("SPEECH_LOAD_TIMING");
++    using clock = std::chrono::steady_clock;
++    std::map<std::string, std::array<double, 3>> spent;  // buffer type -> read s, set s, bytes
++    const auto start = clock::now();
+     for (int64_t i = 0; i < gguf_get_n_tensors(gguf_.get()); i++) {
+         const char * name = gguf_get_tensor_name(gguf_.get(), i);
+         const auto it = by_name_.find(name);
+-        if (it == by_name_.end()) continue;
++        if (it == by_name_.end() || mapped_.count(name)) continue;
+         ggml_tensor * t = it->second;
+         const size_t size = ggml_nbytes(t);
+         bool read = seek_file(f.get(), data_offset + gguf_get_tensor_offset(gguf_.get(), i));
++        auto & where = spent[t->buffer ? ggml_backend_buffer_name(t->buffer) : "none"];
+         for (size_t done = 0; read && done < size;) {
+             const size_t n = std::min(kReadPiece, size - done);
+             piece.resize(std::max(piece.size(), n));
++            const auto t0 = clock::now();
+             read = std::fread(piece.data(), 1, n, f.get()) == n;
++            const auto t1 = clock::now();
+             if (read) ggml_backend_tensor_set(t, piece.data(), done, n);
++            where[0] += std::chrono::duration<double>(t1 - t0).count();
++            where[1] += std::chrono::duration<double>(clock::now() - t1).count();
++            where[2] += (double) n;
+             done += n;
+         }
+         if (!read) throw file_error(std::string("cannot read the tensor ") + name + " of " + path_ + "; the file is shorter than its header says");
+     }
++    if (timing) {
++        std::string report = "experiment: load of " + path_ + " took " +
++                             std::to_string(std::chrono::duration<double>(clock::now() - start).count()) + " s;";
++        for (const auto & [type, s] : spent) {
++            report += " " + type + ": " + std::to_string(s[2] / 1e9) + " GB, read " + std::to_string(s[0]) + " s (" +
++                      std::to_string(s[0] > 0 ? s[2] / 1e6 / s[0] : 0) + " MB/s), set " + std::to_string(s[1]) + " s;";
++        }
++        log_message(LogLevel::Warn, report + "\n");
++    }
+ }
+ 
+ std::string ModelFile::layout_name() const {
+@@ -514,7 +648,10 @@ ModelIdentity read_identity(const ModelFile & file) {
+     }
+     const std::map<ggml_type, uint64_t> bytes = file.type_bytes();
+     const auto most = std::max_element(bytes.begin(), bytes.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+-    if (most == bytes.end() || most->first != named->type) {
++    // Experiment: a mixed-precision file (SPEECH_QUANT_RULES) keeps its base type's name while its experts hold most bytes.
++    if (most != bytes.end() && most->first != named->type && env_on("SPEECH_MIXED_OK")) {
++        // accepted as mixed
++    } else if (most == bytes.end() || most->first != named->type) {
+         throw file_error("the key general.file_type of " + file.path() + " names " + tensor_type_text(named->type) + ", where " +
+                          (most == bytes.end() ? std::string("the file holds no tensor") : "most of its tensors' bytes are " + tensor_type_text(most->first)) +
+                          "; " + file.remedy());
+diff --git a/src/common/model-file.h b/src/common/model-file.h
+index 31cbf4f..b9ca625 100644
+--- a/src/common/model-file.h
++++ b/src/common/model-file.h
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -172,6 +173,15 @@ private:
+     std::shared_ptr<gguf_context> gguf_;
+     /** The shapes and types of every tensor of the file, which ggml reads with its metadata. */
+     std::shared_ptr<ggml_context> ctx_;
++    /**
++     * Experiment (SPEECH_MMAP=1): the file mapped read-only, whose pages back the tensors placed on the CPU, so the
++     * kernel can drop and re-read them instead of their living in anonymous memory. Declared before buffers_ so that
++     * the buffers pointing into it are freed first.
++     */
++    std::shared_ptr<void> map_;
++    size_t map_size_ = 0;
++    /** The tensors whose values are the mapped file's own bytes, which load() leaves alone. */
++    std::set<std::string> mapped_;
+     /** The copies of the loaded tensors, a context for each backend that holds some, none for a reader of the metadata alone. */
+     std::vector<std::unique_ptr<ggml_context, decltype(&ggml_free)>> kept_;
+     /**
+diff --git a/src/common/quantize.cpp b/src/common/quantize.cpp
+index 2c98723..868226a 100644
+--- a/src/common/quantize.cpp
++++ b/src/common/quantize.cpp
+@@ -193,6 +193,17 @@ void write_bytes(FILE * f, const std::vector<uint8_t> & bytes, const std::string
+  * would hold other bytes than the same type made of the F32 weights.
+  */
+ void require_f32(const gguf_context * gguf, const ModelIdentity & identity, const std::string & in, const Layout & layout) {
++    // Experiment: SPEECH_QUANT_FROM_F16=1 takes an F16 file (F16 and F32 tensors), widened to F32 a tensor at a time,
++    // which spares writing a 143 GB F32 copy of Drama 3; the bytes then differ from those made of the F32 file.
++    if (const char * v = std::getenv("SPEECH_QUANT_FROM_F16"); v && *v == '1') {
++        for (int64_t i = 0; i < gguf_get_n_tensors(gguf); i++) {
++            const ggml_type t = gguf_get_tensor_type(gguf, i);
++            if (t != GGML_TYPE_F32 && t != GGML_TYPE_F16) {
++                throw Error(Fault::InvalidArgument, in + " holds a tensor of neither F32 nor F16", "model_path");
++            }
++        }
++        return;
++    }
+     int64_t other = -1;
+     bool quantized = false;
+     for (int64_t i = 0; i < gguf_get_n_tensors(gguf); i++) {
+@@ -244,6 +255,29 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+     for (int64_t i = 0; i < n; i++) {
+         const TensorSpec & spec = specs.at(gguf_get_tensor_name(gguf.get(), i));
+         types[i] = spec.type_in(type.type);
++        // Experiment: SPEECH_QUANT_RULES="_exps=q3_k,attn=q8_0" gives a tensor whose name holds the text before '=' the
++        // type after it, the first rule that matches winning, where the layout takes that type and its rows are whole
++        // blocks of it; a tensor the layout keeps in F32 or F16 stays so.
++        if (const char * rules = std::getenv("SPEECH_QUANT_RULES"); rules && *rules && ggml_is_quantized(types[i])) {
++            std::string all = rules;
++            for (size_t at = 0; at <= all.size();) {
++                const size_t comma = std::min(all.find(',', at), all.size());
++                const std::string rule = all.substr(at, comma - at);
++                at = comma + 1;
++                const size_t eq = rule.find('=');
++                if (eq == std::string::npos || spec.name.find(rule.substr(0, eq)) == std::string::npos) continue;
++                ggml_type want = GGML_TYPE_COUNT;
++                for (int k = 0; k < GGML_TYPE_COUNT; k++) {
++                    const char * tn = ggml_type_name((ggml_type) k);
++                    if (tn && rule.substr(eq + 1) == tn) want = (ggml_type) k;
++                }
++                if (want == GGML_TYPE_COUNT) throw Error(Fault::InvalidArgument, "SPEECH_QUANT_RULES names no ggml type in " + rule, "type");
++                const std::vector<ggml_type> allowed = spec.types();
++                const ggml_tensor * t0 = ggml_get_tensor(meta_ctx.get(), spec.name.c_str());
++                if (std::find(allowed.begin(), allowed.end(), want) != allowed.end() && t0->ne[0] % ggml_blck_size(want) == 0) types[i] = want;
++                break;
++            }
++        }
+         at_least(spec.first_release(types[i]));
+         const ggml_tensor * t = ggml_get_tensor(meta_ctx.get(), spec.name.c_str());
+         bytes_of[types[i]] += ggml_row_size(types[i], t->ne[0]) * (uint64_t) (ggml_nelements(t) / t->ne[0]);
+@@ -251,7 +285,8 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+     // general.file_type names the type that holds most of the bytes, which a layout that keeps its tensors in F32, as
+     // Silero VAD's does, would leave F32.
+     const auto most = std::max_element(bytes_of.begin(), bytes_of.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
+-    if (most != bytes_of.end() && most->first != type.type) {
++    const char * rules_env = std::getenv("SPEECH_QUANT_RULES");
++    if (most != bytes_of.end() && most->first != type.type && !(rules_env && *rules_env)) {
+         throw Error(Fault::InvalidArgument, in + " is a model of " + layout.architecture + ", whose layout keeps most of its weights in " +
+                                                 tensor_type_text(most->first) + " in a file of " + tensor_type_text(type.type) + ", so speech quantize writes no " +
+                                                 tensor_type_text(type.type) + " file of it; use the " + tensor_type_text(most->first) + " file as it is",
+@@ -310,12 +345,16 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+     for (int64_t i = 0; i < n; i++) {
+         const ggml_tensor * t = ggml_get_tensor(meta_ctx.get(), gguf_get_tensor_name(gguf.get(), i));
+         values.resize(ggml_nelements(t));
+-        const size_t size = values.size() * sizeof(float);
++        const bool half = t->type == GGML_TYPE_F16;
++        const size_t size = values.size() * (half ? sizeof(ggml_fp16_t) : sizeof(float));
++        std::vector<ggml_fp16_t> halves(half ? values.size() : 0);
++        void * into = half ? (void *) halves.data() : (void *) values.data();
+         if (!seek_file(source.get(), gguf_get_data_offset(gguf.get()) + gguf_get_tensor_offset(gguf.get(), i)) ||
+-            std::fread(values.data(), 1, size, source.get()) != size) {
++            std::fread(into, 1, size, source.get()) != size) {
+             throw Error(Fault::File, "cannot read the tensor " + std::string(t->name) + " of " + in + "; the file is shorter than its header says",
+                         "model_path");
+         }
++        if (half) ggml_fp16_to_fp32_row(halves.data(), values.data(), (int64_t) values.size());
+         // ggml's quantizers assert that a value is finite where assertions are on and write garbage where they are off.
+         const auto bad = std::find_if(values.begin(), values.end(), [](float v) { return !std::isfinite(v); });
+         if (bad != values.end()) {
+diff --git a/src/engines/drama3-engine.cpp b/src/engines/drama3-engine.cpp
+index d9885d2..ad95e94 100644
+--- a/src/engines/drama3-engine.cpp
++++ b/src/engines/drama3-engine.cpp
+@@ -55,7 +55,10 @@ Placement place_experts(const std::string & path, ggml_backend_t backend) {
+     if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) return {layers, layers};
+     size_t free = 0, total = 0;
+     ggml_backend_dev_memory(device, &free, &total);
+-    const int held = drama3::expert_layers_on_device(file, free, ggml_backend_name(backend));
++    int held = drama3::expert_layers_on_device(file, free, ggml_backend_name(backend));
++    // Experiment: with SPEECH_HOT_EXPERTS the device's spare memory holds the hottest experts of every layer instead
++    // of whole layers, so every layer's full expert tensors stay with the CPU.
++    if (const char * hot = std::getenv("SPEECH_HOT_EXPERTS"); hot && *hot) held = 0;
+     if (held < layers) {
+         log_message(LogLevel::Warn, "Drama 3 computes the experts of " + std::to_string(layers - held) + " of its " + std::to_string(layers) +
+                                         " layers on the CPU, since " + ggml_backend_name(backend) + " holds those of " + std::to_string(held) +
+@@ -80,6 +83,9 @@ public:
+             // threads started for each graph made a row take 95 ms where the pool takes 58, on an RTX 2080 with an
+             // i9-9900K and 8 threads (2026-10-15).
+             ggml_threadpool_params params = ggml_threadpool_params_default(threads);
++            // Experiment (SPEECH_POLL=0..100): how hard the pool's threads spin waiting for the next graph, instead of
++            // sleeping; each layer's experts are a graph of their own, 36 or more a frame.
++            if (const char * poll = std::getenv("SPEECH_POLL"); poll && *poll) params.poll = (uint32_t) std::atoi(poll);
+             pool_.reset(ggml_threadpool_new(&params));
+             if (!pool_) throw Error(Fault::OutOfMemory, "cannot start the CPU's threads for the experts");
+             ggml_backend_cpu_set_threadpool(cpu_.get(), pool_.get());
+diff --git a/src/families/drama3/layout.cpp b/src/families/drama3/layout.cpp
+index dcf803a..39a6273 100644
+--- a/src/families/drama3/layout.cpp
++++ b/src/families/drama3/layout.cpp
+@@ -25,7 +25,12 @@ const Storage kMatrix = quantized_storage({{GGML_TYPE_F32, "0.8.8"},
+                                            {GGML_TYPE_Q8_0, "0.8.8"},
+                                            {GGML_TYPE_Q6_K, "0.8.8"},
+                                            {GGML_TYPE_Q5_K, "0.8.8"},
+-                                           {GGML_TYPE_Q4_K, "0.8.8"}});
++                                           {GGML_TYPE_Q4_K, "0.8.8"},
++                                           // Experiment: lower types that SPEECH_QUANT_RULES may give a matrix.
++                                           {GGML_TYPE_IQ4_XS, "0.8.8"},
++                                           {GGML_TYPE_Q3_K, "0.8.8"},
++                                           {GGML_TYPE_IQ3_S, "0.8.8"},
++                                           {GGML_TYPE_Q2_K, "0.8.8"}});
+ const Storage kCodec = half_storage();
+ const Storage kF32 = float32_storage();
+ 
+diff --git a/src/families/drama3/synthesizer.cpp b/src/families/drama3/synthesizer.cpp
+index c6bd7df..04ac1fd 100644
+--- a/src/families/drama3/synthesizer.cpp
++++ b/src/families/drama3/synthesizer.cpp
+@@ -1,6 +1,9 @@
+ #include "synthesizer.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <deque>
+ #include <optional>
+ 
+@@ -17,6 +20,54 @@ int64_t window_frames(int i) {
+     return int64_t(4) << std::min(i, 5);
+ }
+ 
++/**
++ * Fidelity experiment, switched by the environment:
++ * - SPEECH_RECORD=path: append each generated frame (main token, then the codes) as int32s.
++ * - SPEECH_FORCE=path: replay a recorded frame sequence instead of sampling; the speech ends with it.
++ * - SPEECH_LOGITS=path: append the logits each step computes: int32 step, int32 head (0 = main, 1 + b = codebook b),
++ *   int32 count, then count floats.
++ * Replaying a recording against the model that made it must give identical logits, which checks the harness.
++ */
++struct Fidelity {
++    FILE * record = nullptr;
++    FILE * logits = nullptr;
++    std::vector<std::vector<int32_t>> forced;
++    int64_t step = 0;
++
++    explicit Fidelity(int width) {
++        if (const char * p = std::getenv("SPEECH_RECORD"); p && *p) record = std::fopen(p, "ab");
++        if (const char * p = std::getenv("SPEECH_LOGITS"); p && *p) logits = std::fopen(p, "ab");
++        if (const char * p = std::getenv("SPEECH_FORCE"); p && *p) {
++            FILE * f = std::fopen(p, "rb");
++            if (!f) throw Error(Fault::Io, std::string("cannot open SPEECH_FORCE file ") + p);
++            std::vector<int32_t> frame((size_t) width);
++            while (std::fread(frame.data(), sizeof(int32_t), frame.size(), f) == frame.size()) forced.push_back(frame);
++            std::fclose(f);
++        }
++    }
++    ~Fidelity() {
++        if (record) std::fclose(record);
++        if (logits) std::fclose(logits);
++    }
++    void dump(int head, const std::vector<float> & v) const {
++        if (!logits) return;
++        const int32_t h[3] = {(int32_t) step, (int32_t) head, (int32_t) v.size()};
++        std::fwrite(h, sizeof h, 1, logits);
++        std::fwrite(v.data(), sizeof(float), v.size(), logits);
++    }
++};
++
++using Clock = std::chrono::steady_clock;
++
++double seconds_since(Clock::time_point t) {
++    return std::chrono::duration<double>(Clock::now() - t).count();
++}
++
++Fidelity & fidelity(int width) {
++    static Fidelity f(width);
++    return f;
++}
++
+ }  // namespace
+ 
+ /** What a chunk spoke: its codes, [codebooks, frames] with the frame fastest, and how it ended. */
+@@ -84,6 +135,11 @@ Synthesizer::Chunk Synthesizer::speak(const std::vector<int32_t> & rows, int64_t
+     for (int64_t i = 0; i < n; i++) mains.push_back(rows[(size_t) (i * width)]);
+ 
+     Chunk chunk;
++    // Experiment (SPEECH_STEP_TIMING=1): where each frame's time goes.
++    struct {
++        double text = 0, head = 0, decoder = 0, codec = 0;
++        int64_t frames = 0;
++    } spent;
+     std::vector<std::vector<int32_t>> drawn;
+     int64_t sent = 0;
+     int windows = 0;
+@@ -105,25 +161,60 @@ Synthesizer::Chunk Synthesizer::speak(const std::vector<int32_t> & rows, int64_t
+             chunk.stopped = true;
+             return chunk;
+         }
+-        const int32_t main = sampler.main(text_.logits(last), mains, uniform(rng), uniform(rng));
++        Fidelity & fid = fidelity(width);
++        const bool forcing = !fid.forced.empty();
++        if (forcing && fid.step >= (int64_t) fid.forced.size()) {
++            chunk.ended = true;
++            break;
++        }
++        auto t0 = Clock::now();
++        const std::vector<float> main_logits = text_.logits(last);
++        fid.dump(0, main_logits);
++        const int32_t main = forcing ? fid.forced[(size_t) fid.step][0] : sampler.main(main_logits, mains, uniform(rng), uniform(rng));
++        spent.head += seconds_since(t0);
+         if (main == eos_) {
+             chunk.ended = true;
+             break;
+         }
++        t0 = Clock::now();
++        int book = 0;
+         const std::vector<int32_t> codes = decoder_.step(last, frame, main, [&](int, const std::vector<float> & logits) {
+-            return sampler.code(logits, uniform(rng));
++            fid.dump(1 + book, logits);
++            // The decoder derives codes[0] from the main token and asks for codes[1 + book]; a recorded frame is
++            // main, then codes[0..], so the code asked for sits at 2 + book.
++            const int32_t code = forcing ? fid.forced[(size_t) fid.step][(size_t) (2 + book)] : sampler.code(logits, uniform(rng));
++            book++;
++            return code;
+         });
++        spent.decoder += seconds_since(t0);
++        if (fid.record) {
++            std::fwrite(&main, sizeof main, 1, fid.record);
++            std::fwrite(codes.data(), sizeof(int32_t), codes.size(), fid.record);
++            std::fflush(fid.record);
++        }
++        if (fid.logits) std::fflush(fid.logits);
++        fid.step++;
+         frame.assign(1, main);
+         frame.insert(frame.end(), codes.begin(), codes.end());
+         mains.push_back(main);
+         drawn.push_back(codes);
++        t0 = Clock::now();
+         if ((int64_t) drawn.size() - sent >= window_frames(windows) && !pass((int64_t) drawn.size())) {
+             chunk.stopped = true;
+             return chunk;
+         }
++        spent.codec += seconds_since(t0);
++        t0 = Clock::now();
+         if (step + 1 < r.max_frames) last = text_.run(text_.embed(frame, 1), 1);
++        spent.text += seconds_since(t0);
++        spent.frames++;
+     }
+     if (!pass((int64_t) drawn.size())) chunk.stopped = true;
++    if (const char * v = std::getenv("SPEECH_STEP_TIMING"); v && *v == '1' && spent.frames > 0) {
++        std::fprintf(stderr, "experiment: %lld frames, per frame ms: text model %.2f, head+sample %.2f, audio decoder %.2f, codec %.2f\n",
++                     (long long) spent.frames, 1e3 * spent.text / spent.frames, 1e3 * spent.head / spent.frames,
++                     1e3 * spent.decoder / spent.frames, 1e3 * spent.codec / spent.frames);
++    }
+     chunk.frames = (int64_t) drawn.size();
+     chunk.codes.resize((size_t) (codebooks * chunk.frames));
+     for (int64_t f = 0; f < chunk.frames; f++)
+diff --git a/src/families/drama3/text-model.cpp b/src/families/drama3/text-model.cpp
+index d1ea780..85eebd2 100644
+--- a/src/families/drama3/text-model.cpp
++++ b/src/families/drama3/text-model.cpp
+@@ -2,7 +2,19 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ #include <stdexcept>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
+ 
+ #include "error.h"
+ 
+@@ -15,6 +27,18 @@ namespace {
+  * for a block of the longest prompt, 8,192 rows of 16 heads.
+  */
+ constexpr int64_t kBlockRows = 512;
++
++/**
++ * Experiment: the file named by SPEECH_EXPERT_LOG, or null. Each graph appends one record of int32s:
++ * n_past, rows, layers, then per layer: layer index, then rows x used expert ids.
++ */
++FILE * expert_log() {
++    static FILE * f = [] {
++        const char * path = std::getenv("SPEECH_EXPERT_LOG");
++        return path && *path ? std::fopen(path, "ab") : nullptr;
++    }();
++    return f;
++}
+ /** The epsilon of the official l2norm() of the Gated DeltaNet's queries and keys: x * rsqrt(sum(x^2) + 1e-6). */
+ constexpr float kL2Eps = 1e-6f;
+ 
+@@ -22,6 +46,51 @@ std::string layer_name(int l) {
+     return "blk." + std::to_string(l) + ".";
+ }
+ 
++/**
++ * Experiment (SPEECH_PREFETCH_EXPERTS): ask the OS to read routed experts' weights ahead of their use, for weights the
++ * CPU reads from a mapped file (SPEECH_MMAP) that RAM cannot hold. "same": a layer's chosen experts as soon as its router
++ * picks them, all at once, instead of a page fault at a time. "next": also the experts the NEXT layer's router would pick
++ * from this layer's input (pre-gating), a layer ahead.
++ */
++enum class Prefetch { None, Same, Next };
++
++Prefetch prefetch_mode() {
++    static const Prefetch mode = [] {
++        const char * v = std::getenv("SPEECH_PREFETCH_EXPERTS");
++        if (!v) return Prefetch::None;
++        if (!std::strcmp(v, "same")) return Prefetch::Same;
++        if (!std::strcmp(v, "next")) return Prefetch::Next;
++        return Prefetch::None;
++    }();
++    return mode;
++}
++
++void advise_willneed(const char * addr, size_t len) {
++#ifdef _WIN32
++    WIN32_MEMORY_RANGE_ENTRY range{(void *) addr, len};
++    PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
++#else
++    static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
++    const uintptr_t start = (uintptr_t) addr & ~(page - 1);
++    madvise((void *) start, len + ((uintptr_t) addr - start), MADV_WILLNEED);
++#endif
++}
++
++/** A ggml custom op on the CPU: passes its expert ids through and advises the OS to read those experts' slices. */
++void prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int, void * userdata) {
++    if (ith != 0) return;
++    std::memcpy(dst->data, a->data, ggml_nbytes(a));
++    const auto * t = (const TextModel::PrefetchTarget *) userdata;
++    const auto * ids = (const int32_t *) a->data;
++    std::vector<bool> seen((size_t) t->experts, false);
++    for (int64_t i = 0; i < ggml_nelements(a); i++) {
++        const int32_t e = ids[i];
++        if (e < 0 || e >= t->experts || seen[(size_t) e]) continue;
++        seen[(size_t) e] = true;
++        for (int k = 0; k < 3; k++) advise_willneed(t->base[k] + (size_t) e * t->stride[k], t->stride[k]);
++    }
++}
++
+ }  // namespace
+ 
+ /**
+@@ -94,7 +163,109 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
+         // made it take 2.5 s where the CPU took 1.0 s, on an RTX 2080 with Vulkan and an i9-9900K (2026-10-15).
+         sched_ = ggml_backend_sched_new(backends, nullptr, 2, 32768, false, false);
+         if (!sched_) throw Error(Fault::OutOfMemory, "cannot create the scheduler of the text model's graphs");
++        if (const char * list = std::getenv("SPEECH_HOT_EXPERTS"); list && *list) load_hot_experts(cpu);
++    }
++}
++
++TextModel::PrefetchTarget * TextModel::prefetch_target(int l) {
++    if (prefetch_.empty()) prefetch_.resize((size_t) layers());
++    PrefetchTarget & t = prefetch_[(size_t) l];
++    if (!t.checked) {
++        t.checked = true;
++        const std::string p = layer_name(l);
++        const char * names[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
++        bool host = true;
++        for (int k = 0; k < 3; k++) {
++            const ggml_tensor * w = m_.tensor(p + names[k]);
++            host = host && w->buffer && ggml_backend_buffer_is_host(w->buffer);
++            t.base[k] = (const char *) w->data;
++            t.stride[k] = w->nb[2];
++        }
++        t.experts = experts_;
++        t.usable = host;  // only weights the CPU reads in place; a GPU copy needs no advice
+     }
++    return t.usable ? &t : nullptr;
++}
++
++void TextModel::load_hot_experts(ggml_backend_t cpu) {
++    const char * list = std::getenv("SPEECH_HOT_EXPERTS");
++    const char * gb = std::getenv("SPEECH_HOT_GB");
++    const double budget = gb ? std::atof(gb) * 1073741824.0 : 0.0;
++    // The list: one "layer expert" per line, hottest first. Take experts in that order while the budget lasts.
++    FILE * f = std::fopen(list, "r");
++    if (!f) throw Error(Fault::Io, std::string("cannot open SPEECH_HOT_EXPERTS ") + list);
++    std::vector<std::vector<int>> chosen((size_t) layers());
++    double used_bytes = 0;
++    int taken = 0, l = 0, e = 0;
++    while (std::fscanf(f, "%d %d", &l, &e) == 2) {
++        if (l < first_ || l >= last_ || e < 0 || e >= experts_) continue;
++        const std::string p = layer_name(l);
++        const ggml_tensor * full = m_.tensor(p + "ffn_gate_exps");
++        if (ggml_backend_buffer_is_host(full->buffer) == false) continue;  // this layer's experts are on the device already
++        const double bytes = (double) (m_.tensor(p + "ffn_gate_exps")->nb[2] + m_.tensor(p + "ffn_up_exps")->nb[2] +
++                                       m_.tensor(p + "ffn_down_exps")->nb[2]);
++        if (used_bytes + bytes > budget) break;
++        used_bytes += bytes;
++        chosen[(size_t) l].push_back(e);
++        taken++;
++    }
++    std::fclose(f);
++    if (taken == 0) {
++        std::fprintf(stderr, "experiment: no hot experts; every layer's experts stay with the CPU\n");
++        return;
++    }
++    hot_.assign((size_t) layers(), {});
++    const size_t n_tensors = (size_t) layers() * 3 + 1;
++    hot_ctx_.reset(ggml_init({ggml_tensor_overhead() * n_tensors, nullptr, true}));
++    map_ctx_.reset(ggml_init({ggml_tensor_overhead() * n_tensors, nullptr, true}));
++    for (int layer = first_; layer < last_; layer++) {
++        const auto & hot = chosen[(size_t) layer];
++        if (hot.empty()) continue;
++        const std::string p = layer_name(layer);
++        HotLayer & h = hot_[(size_t) layer];
++        // At least as many slots as picks per row: the hot experts, then zero slots (the first is where cold picks go).
++        const int64_t n_slots = std::max<int64_t>((int64_t) hot.size() + 1, used_);
++        const auto slots = [&](const char * name) {
++            const ggml_tensor * full = m_.tensor(p + name);
++            return ggml_new_tensor_3d(hot_ctx_.get(), full->type, full->ne[0], full->ne[1], n_slots);
++        };
++        h.gate = slots("ffn_gate_exps");
++        h.up = slots("ffn_up_exps");
++        h.down = slots("ffn_down_exps");
++        h.to_slot = ggml_new_tensor_2d(map_ctx_.get(), GGML_TYPE_I32, 1, experts_);
++        h.to_cpu = ggml_new_tensor_2d(map_ctx_.get(), GGML_TYPE_I32, 1, experts_);
++        h.is_hot = ggml_new_tensor_2d(map_ctx_.get(), GGML_TYPE_F32, 1, experts_);
++    }
++    hot_buf_.reset(ggml_backend_alloc_ctx_tensors(hot_ctx_.get(), backend_));
++    map_buf_.reset(ggml_backend_alloc_ctx_tensors(map_ctx_.get(), cpu));
++    if (!hot_buf_ || !map_buf_) throw Error(Fault::OutOfMemory, "cannot allocate the hot experts");
++    for (int layer = first_; layer < last_; layer++) {
++        const auto & hot = chosen[(size_t) layer];
++        HotLayer & h = hot_[(size_t) layer];
++        if (hot.empty()) continue;
++        const std::string p = layer_name(layer);
++        std::vector<int32_t> to_slot((size_t) experts_, (int32_t) hot.size()), to_cpu((size_t) experts_);
++        std::vector<float> is_hot((size_t) experts_, 0.0f);
++        for (int x = 0; x < experts_; x++) to_cpu[(size_t) x] = x;
++        const bool noskip = std::getenv("SPEECH_HOT_NOSKIP") != nullptr;  // debug: the CPU recomputes hot picks too
++        for (size_t s = 0; s < hot.size(); s++) {
++            to_slot[(size_t) hot[s]] = (int32_t) s;
++            to_cpu[(size_t) hot[s]] = noskip ? hot[s] : -1;
++            is_hot[(size_t) hot[s]] = 1.0f;
++        }
++        for (auto [dst, name] : {std::pair{h.gate, "ffn_gate_exps"}, {h.up, "ffn_up_exps"}, {h.down, "ffn_down_exps"}}) {
++            const ggml_tensor * full = m_.tensor(p + name);
++            for (size_t s = 0; s < hot.size(); s++) {
++                ggml_backend_tensor_set(dst, (const char *) full->data + (size_t) hot[s] * full->nb[2], s * dst->nb[2], full->nb[2]);
++            }
++            const std::vector<uint8_t> zeros(dst->nb[2], 0);  // zero blocks: every quantized type decodes them to 0
++            for (int64_t s = (int64_t) hot.size(); s < dst->ne[2]; s++) ggml_backend_tensor_set(dst, zeros.data(), (size_t) s * dst->nb[2], dst->nb[2]);
++        }
++        ggml_backend_tensor_set(h.to_slot, to_slot.data(), 0, ggml_nbytes(h.to_slot));
++        ggml_backend_tensor_set(h.to_cpu, to_cpu.data(), 0, ggml_nbytes(h.to_cpu));
++        ggml_backend_tensor_set(h.is_hot, is_hot.data(), 0, ggml_nbytes(h.is_hot));
++    }
++    std::fprintf(stderr, "experiment: %d hot experts (%.2f GB) copied to %s\n", taken, used_bytes / 1073741824.0, ggml_backend_name(backend_));
+ }
+ 
+ TextModel::~TextModel() {
+@@ -202,13 +373,52 @@ ggml_tensor * TextModel::experts(Graph & g, int l, ggml_tensor * x, ggml_tensor
+     *router = mul_mat(c, m_.tensor(p + "ffn_gate_inp"), x);
+     ggml_tensor * probabilities = ggml_soft_max(c, *router);
+     ggml_tensor * chosen = ggml_top_k(c, probabilities, used_);
++    if (expert_log()) {
++        ggml_tensor * copy = ggml_cont(c, chosen);
++        g.output(copy);
++        chosen_log_.emplace_back(l, copy);
++    }
++    if (prefetch_mode() != Prefetch::None) {
++        if (PrefetchTarget * t = prefetch_target(l)) {
++            // The pass-through feeds the experts below, so the scheduler runs the advice before they compute.
++            chosen = ggml_map_custom1(c, ggml_cont(c, chosen), prefetch_op, 1, t);
++        }
++        if (prefetch_mode() == Prefetch::Next && l + 1 < last_) {
++            if (PrefetchTarget * t = prefetch_target(l + 1)) {
++                const std::string q = layer_name(l + 1);
++                ggml_tensor * guess = ggml_top_k(c, ggml_soft_max(c, mul_mat(c, m_.tensor(q + "ffn_gate_inp"), x)), used_);
++                ggml_tensor * advised = ggml_map_custom1(c, ggml_cont(c, guess), prefetch_op, 1, t);
++                g.output(advised);  // nothing else reads it; marking it an output keeps it in the graph
++                if (expert_log()) chosen_log_.emplace_back(1000 + l + 1, advised);  // the guess, to score against layer l+1
++            }
++        }
++    }
+     ggml_tensor * weights = ggml_get_rows(c, ggml_reshape_3d(c, probabilities, 1, experts_, n), chosen);
+     if (norm_topk_) weights = ggml_div(c, weights, ggml_reshape_3d(c, ggml_sum_rows(c, ggml_reshape_2d(c, weights, used_, n)), 1, 1, n));
+     ggml_tensor * rows = ggml_reshape_3d(c, x, h_, 1, n);
+-    ggml_tensor * gate = mul_mat_id(c, m_.tensor(p + "ffn_gate_exps"), rows, chosen);
+-    ggml_tensor * up = mul_mat_id(c, m_.tensor(p + "ffn_up_exps"), rows, chosen);
+-    ggml_tensor * down = mul_mat_id(c, m_.tensor(p + "ffn_down_exps"), ggml_mul(c, ggml_silu(c, gate), up), chosen);
+-    down = ggml_mul(c, down, weights);
++    ggml_tensor * down = nullptr;
++    if (!hot_.empty() && hot_[(size_t) l].gate) {
++        // Each pick goes to the device's copy when hot and to the CPU's tensor when cold; the other path computes it
++        // from the zero slot (device) or skips it (CPU, id -1), and the hot weights select which result counts.
++        const HotLayer & hl = hot_[(size_t) l];
++        ggml_tensor * flat = ggml_reshape_1d(c, ggml_cont(c, chosen), used_ * n);
++        ggml_tensor * to_slot = ggml_reshape_2d(c, ggml_get_rows(c, hl.to_slot, flat), used_, n);
++        ggml_tensor * to_cpu = ggml_reshape_2d(c, ggml_get_rows(c, hl.to_cpu, flat), used_, n);
++        ggml_tensor * hot_w = ggml_reshape_3d(c, ggml_get_rows(c, hl.is_hot, flat), 1, used_, n);
++        ggml_tensor * g_gate = mul_mat_id(c, hl.gate, rows, to_slot);
++        ggml_tensor * g_up = mul_mat_id(c, hl.up, rows, to_slot);
++        ggml_tensor * g_down = mul_mat_id(c, hl.down, ggml_mul(c, ggml_silu(c, g_gate), g_up), to_slot);
++        ggml_tensor * c_gate = mul_mat_id(c, m_.tensor(p + "ffn_gate_exps"), rows, to_cpu);
++        ggml_tensor * c_up = mul_mat_id(c, m_.tensor(p + "ffn_up_exps"), rows, to_cpu);
++        ggml_tensor * c_down = mul_mat_id(c, m_.tensor(p + "ffn_down_exps"), ggml_mul(c, ggml_silu(c, c_gate), c_up), to_cpu);
++        ggml_tensor * w_hot = ggml_mul(c, weights, hot_w);
++        down = ggml_add(c, ggml_mul(c, g_down, w_hot), ggml_mul(c, c_down, ggml_sub(c, weights, w_hot)));
++    } else {
++        ggml_tensor * gate = mul_mat_id(c, m_.tensor(p + "ffn_gate_exps"), rows, chosen);
++        ggml_tensor * up = mul_mat_id(c, m_.tensor(p + "ffn_up_exps"), rows, chosen);
++        down = mul_mat_id(c, m_.tensor(p + "ffn_down_exps"), ggml_mul(c, ggml_silu(c, gate), up), chosen);
++        down = ggml_mul(c, down, weights);
++    }
+     ggml_tensor * sum = nullptr;
+     for (int e = 0; e < used_; e++) {
+         ggml_tensor * one = ggml_view_2d(c, down, h_, n, down->nb[2], (size_t) e * down->nb[1]);
+@@ -278,6 +488,20 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
+                                      stages ? &kept : nullptr);
+         if (sched_) g.compute(sched_);
+         else g.compute(backend_, allocr_);
++        if (FILE * log = expert_log(); log && !chosen_log_.empty()) {
++            const int32_t head[3] = {(int32_t) n_past_, (int32_t) rows, (int32_t) chosen_log_.size()};
++            std::fwrite(head, sizeof head, 1, log);
++            std::vector<int32_t> ids;
++            for (auto & [layer, t] : chosen_log_) {
++                ids.resize((size_t) ggml_nelements(t));
++                ggml_backend_tensor_get(t, ids.data(), 0, ggml_nbytes(t));
++                const int32_t l32 = layer;
++                std::fwrite(&l32, sizeof l32, 1, log);
++                std::fwrite(ids.data(), sizeof(int32_t), ids.size(), log);
++            }
++            std::fflush(log);
++        }
++        chosen_log_.clear();
+         if (stages) {
+             for (int i = 0; i < count; i++) {
+                 std::vector<float> * where[] = {&stages->mixer[(size_t) i], &stages->router[(size_t) i], &stages->moe[(size_t) i],
+@@ -298,6 +522,8 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
+ ggml_tensor * TextModel::build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept) {
+     ggml_context * c = g.ctx();
+     const int64_t rows = x->ne[1];
++    // reserve() builds graphs it never computes; only the graph built last is the one run() reads back.
++    chosen_log_.clear();
+     // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
+     const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
+     ggml_tensor * pos = attends ? positions(g, n_past_, rows) : nullptr;
+diff --git a/src/families/drama3/text-model.h b/src/families/drama3/text-model.h
+index 114488c..a12adbe 100644
+--- a/src/families/drama3/text-model.h
++++ b/src/families/drama3/text-model.h
+@@ -106,6 +106,38 @@ private:
+     ggml_tensor * build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept);
+     /** The experts and the shared expert on `x`, and the router's logits in `router`. */
+     ggml_tensor * experts(Graph & g, int l, ggml_tensor * x, ggml_tensor ** router);
++    /** Experiment (SPEECH_EXPERT_LOG=path): the experts each layer of the graph being built chose, layer by layer. */
++    std::vector<std::pair<int, ggml_tensor *>> chosen_log_;
++
++    /**
++     * Experiment (SPEECH_HOT_EXPERTS=list, SPEECH_HOT_GB=budget): copies of the hottest routed experts on the device,
++     * the rest computed by the CPU from the full tensors. Per layer: the hot experts' gate/up/down with one zero slot
++     * last, and maps from an expert id to its hot slot (cold -> the zero slot), to itself on the CPU (hot -> -1, which the
++     * patched CPU mul_mat_id skips) and to 1 or 0 for hot.
++     */
++    struct HotLayer {
++        ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;
++        ggml_tensor *to_slot = nullptr, *to_cpu = nullptr, *is_hot = nullptr;
++    };
++    std::vector<HotLayer> hot_;
++    std::unique_ptr<ggml_context, decltype(&ggml_free)> hot_ctx_{nullptr, ggml_free}, map_ctx_{nullptr, ggml_free};
++    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> hot_buf_{nullptr, ggml_backend_buffer_free},
++        map_buf_{nullptr, ggml_backend_buffer_free};
++    void load_hot_experts(ggml_backend_t cpu);
++
++public:
++    /** Experiment (SPEECH_PREFETCH_EXPERTS): where one layer's routed experts live in host memory. */
++    struct PrefetchTarget {
++        const char * base[3] = {nullptr, nullptr, nullptr};  // gate, up, down
++        size_t stride[3] = {0, 0, 0};                        // bytes of one expert in each
++        int experts = 0;
++        bool checked = false, usable = false;
++    };
++
++private:
++    /** The layer's target, or null where its experts are not read in place from host memory. */
++    PrefetchTarget * prefetch_target(int l);
++    std::vector<PrefetchTarget> prefetch_;
+ 
+     ggml_backend_t backend_;
+     const ModelFile & m_;

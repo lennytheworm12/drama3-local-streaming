@@ -1,0 +1,9 @@
+# Model weights, audio and run output stay out of the repo.
+*.gguf
+*.wav
+*.mp3
+*.flac
+*.zip
+__pycache__/
+*.pyc
+*.log
