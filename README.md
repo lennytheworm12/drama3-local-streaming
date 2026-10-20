@@ -13,7 +13,7 @@ The target use is offline narration: script in, audio file out. The project has 
 - **The speed limit is the GPU↔CPU handoff and small GPU dispatches**, so what helps is fitting more layers on the GPU and a cheaper handoff (native Windows rather than WSL).
 - **Fused audio decoder, freed VRAM and flash attention** took one Q4_K take from 0.65× to 0.77×. The VRAM savings (half-precision caches sized for a line, `token_embd` on the CPU) are also what made four concurrent takes fit.
 - **Q2_K experts** give 1.4× the speed at 55% of the RAM for about +0.6 WER points. A blind test with a fixed voice found they flatten intonation, so Q4_K is the quality default.
-- **Didn't help**: CPU expert repacking, Q8_0, self-draft speculative decoding, one GPU submission per frame, op fusion.
+- **Didn't help**: CPU expert repacking, Q8_0, self-draft speculative decoding, one GPU submission per frame, op fusion, next-layer pre-gating, hot-expert tiering, and a native CUDA build in place of Vulkan.
 
 ## Why it's possible
 
@@ -57,7 +57,7 @@ This repo holds patches, scripts and measurements only. It does not include the 
 6. **Q4_K speed.** Done: fused audio decoder, VRAM spill fix, freed VRAM, flash attention. 0.77× for one take.
 7. **Batch takes.** Done as concurrent streams: four takes at once give 1.24–1.27× realtime throughput.
 
-Next: in-between expert mixes (IQ4_XS, Q2_K on only some layers, an imatrix) to find where speed stops costing intonation; KL on more sentences; a native Windows CUDA build to compare with Vulkan.
+Next: in-between expert mixes (IQ4_XS, Q2_K on only some layers, an imatrix) to find where speed stops costing intonation; KL on more sentences; cutting the GPU's idle time waiting on the CPU (a native Windows CUDA build was no faster than Vulkan, so kernels aren't the limit).
 
 ## Licence note
 

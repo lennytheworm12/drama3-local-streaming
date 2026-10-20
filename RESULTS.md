@@ -296,6 +296,12 @@ before).
 | One submission per frame (`SPEECH_ONE_GRAPH=1`: decoder, embedding, text model and head in one scheduled graph) | Bit-identical, but 64.7 against 64.5 ms per frame. Graph launches were not the cost; the 73 scheduler splits a frame stay either way. |
 | Op fusion (`SPEECH_FUSE_OPS=1`: router in llama.cpp's node order for Vulkan's topk_moe kernel, swiglu as one node) | 53.2 against 52.8 ms. Fusing the router lost the sigmoid-mul and multi-add fusions, and the router was about 2% of GPU time. |
 
+### Native Windows CUDA build
+
+A native Windows CUDA build with the same patches and switches is no faster than Vulkan: one stream 0.773× against
+0.769×, four streams 1.19× against 1.24–1.27×. The two backends' kernels differ, but the speed hardly moves, so what
+remains is GPU idle time waiting on the CPU rather than kernel quality. Vulkan stays the default.
+
 The floor for a single take on this rig is about 60 ms per frame: CPU experts about 22 ms, GPU dispatches about 18 ms,
 copies about 10 ms, decoder about 9 ms, codec about 2.5 ms. Going lower needs a bigger GPU (more expert layers, fewer
 handoffs) or a change to the model's arithmetic.
@@ -389,5 +395,5 @@ voice file with `speech voice`. It holds: ECAPA similarity to the reference is 0
   suits narration, since several takes per line are wanted anyway.
 - Use the mmap loader when RAM is short; fread is steadier when other apps press on memory on Windows.
 - Next: in-between expert mixes (IQ4_XS, Q2_K on only some layers, an imatrix) to find where speed stops costing
-  intonation, judged by KL first and then by ear; KL on more sentences; a CUDA build on native Windows to compare
-  with Vulkan.
+  intonation, judged by KL first and then by ear; KL on more sentences; cutting the GPU's wait on the CPU, which
+  the CUDA comparison points to as the remaining cost.
