@@ -58,9 +58,37 @@ def compare(ref, var):
     return per_head, missing
 
 
+def sampled(logits, top_k=30, top_p=0.9):
+    """The distribution Drama 3's sampler draws from: the top_k by probability, those within top_p (the first always),
+    renormalized. Returns {token: probability}."""
+    lp = log_softmax(logits)
+    order = sorted(range(len(lp)), key=lambda i: -lp[i])[:top_k]
+    kept, cum = [], 0.0
+    for r, i in enumerate(order):
+        cum += math.exp(lp[i])
+        if r > 0 and cum > top_p:
+            break
+        kept.append(i)
+    total = sum(math.exp(lp[i]) for i in kept)
+    return {i: math.exp(lp[i]) / total for i in kept}
+
+
+def acceptance(ref, var, head=0):
+    """Speculative sampling's expected acceptance of a token drawn from `var` (the draft) when `ref` (the full model)
+    verifies it: the mean over steps of sum_t min(p_ref(t), p_var(t)), on the sampler's truncated distributions."""
+    vals = []
+    for key, r in ref.items():
+        if key[1] != head or key not in var:
+            continue
+        p, q = sampled(r), sampled(var[key])
+        vals.append(sum(min(p.get(t, 0.0), q.get(t, 0.0)) for t in set(p) | set(q)))
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
 def main():
     ref, var = read(sys.argv[1]), read(sys.argv[2])
     per_head, missing = compare(ref, var)
+    print(f"speculative acceptance of the main token (draft = second file): {100 * acceptance(ref, var):.1f}%")
     print("| head | steps | mean KL (nats) | top-1 agreement |")
     print("|---|---|---|---|")
     tot = [0.0, 0, 0]
