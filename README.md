@@ -6,12 +6,14 @@ The target use is offline narration: script in, audio file out. The project has 
 
 ## Where it stands
 
-**Best setup so far: native Windows Vulkan build of speech.cpp with our patches, mmap loader with prefetch, Q2_K routed experts. 0.70× realtime, ready in 11 s, 7.4 GB of RAM** (stock under WSL: 0.44×, 287 s to start, 16 GB). Full numbers in [RESULTS.md](RESULTS.md).
+**Best setup so far: native Windows Vulkan build of speech.cpp with our patches and the published Q4_K. One take runs at 0.77× realtime, and four takes side by side give 1.24–1.27× realtime throughput** (stock under WSL: 0.44×, 287 s to start, 16 GB). Full numbers in [RESULTS.md](RESULTS.md).
 
 - **mmap loader**: startup in seconds instead of minutes, bit-identical output, and the model runs under a 16 GB RAM cap where the stock loader is OOM-killed.
 - **SSD streaming works**, and prefetching the router's chosen experts makes it 1.5–2.25× faster under a RAM cap.
-- **The speed limit is the GPU↔CPU handoff** (about 1.1 ms per CPU-computed layer per frame), so what helps is fitting more layers on the GPU (smaller expert quants) and a cheaper handoff (native Windows rather than WSL).
-- **Q2_K experts** give 1.4× the speed at 55% of the RAM for about +0.6 WER points, and came out on top in a blind listening test.
+- **The speed limit is the GPU↔CPU handoff and small GPU dispatches**, so what helps is fitting more layers on the GPU and a cheaper handoff (native Windows rather than WSL).
+- **Fused audio decoder, freed VRAM and flash attention** took one Q4_K take from 0.65× to 0.77×. The VRAM savings (half-precision caches sized for a line, `token_embd` on the CPU) are also what made four concurrent takes fit.
+- **Q2_K experts** give 1.4× the speed at 55% of the RAM for about +0.6 WER points. A blind test with a fixed voice found they flatten intonation, so Q4_K is the quality default.
+- **Didn't help**: CPU expert repacking, Q8_0, self-draft speculative decoding, one GPU submission per frame, op fusion.
 
 ## Why it's possible
 
@@ -34,11 +36,12 @@ The target use is offline narration: script in, audio file out. The project has 
 | [`docs/build-windows.md`](docs/build-windows.md) | Building the patched speech.cpp natively on Windows with MSVC and Vulkan. |
 | [`docs/test-plan.md`](docs/test-plan.md) | The optimisation test plan: experiments, the scorecard, pass/fail criteria. |
 | [`docs/step1-baseline.md`](docs/step1-baseline.md) | The first SSD-streaming experiment in full. |
-| [`narrate.cmd`](narrate.cmd), [`narrate.py`](narrate.py) | Narrate a text file on the best setup: one segment per line, several takes each, a stitched `narration.wav`. Example input: [`examples-cold-open.txt`](examples-cold-open.txt). |
+| [`narrate.cmd`](narrate.cmd), [`narrate.py`](narrate.py) | Narrate a text file on the best setup: one segment per line (each under 2,048 prompt rows), several takes each generated four at a time (`--streams 1` for one at a time), a stitched `narration.wav`. Example input: [`examples-cold-open.txt`](examples-cold-open.txt). |
 | [`scorecard/`](scorecard/) | The test harness, a library of three stages: `gen.py` (one loaded `speech worker`, every take) → `asr.py` (Qwen3-ASR) → `score.py` (WER/CER, flags). Also `mos.py` (UTMOS, voice drift), `kana_cer.py` (Japanese kana CER), `expert_stats.py` (router logs, cache simulation), `fidelity.py` (teacher-forced KL). Unit tests are `test_*.py`. |
 | `scorecard/*.sh` | Experiment drivers: `exp_queue.sh` (threads, load, experts), `mmap_sweep.sh` / `ra_test.sh` (RAM cap, readahead), `pf_sweep.sh` (expert prefetch), `tier_runs.sh` / `ovh*_runs.sh` (hot-expert tiering, handoff overhead), `quant_fid.sh` / `quant_score.sh` (quants, KL), `bench.sh ja\|en` (public benchmarks). |
 | `scorecard/corpus*.jsonl` | Fixed text sets: 20 English sentences + 1 paragraph, a contrast set, speech-bench's Japanese prompts, a 100-utterance LibriSpeech test-clean subset. |
-| `scorecard/tools/` | Helpers: speed and step summaries, sweep stats, the listening-pack builder, the Windows build script and benchmark wrappers. |
+| `scorecard/tp.py` | Throughput of a worker serving several takes at once (`SPEECH_STREAMS`). |
+| `scorecard/tools/` | Helpers: speed and step summaries, sweep stats, the listening-pack builders, the Windows build scripts (`build_win3.cmd` is current), the Windows benchmark drivers (`win_bench_*.ps1`) and the Vulkan profile summary (`vk_perf_sum.py`). |
 
 The scripts carry the paths of the rig they ran on (`/mnt/c/Users/...`, `~/drama3/...`, `~/models/...`); edit them for yours.
 
@@ -49,11 +52,12 @@ This repo holds patches, scripts and measurements only. It does not include the 
 1. **Baseline.** Done: 0.4× realtime, 16 GB anonymous RAM, no streaming (speech.cpp reads the whole file with fread), OOM under a 16 GB cap.
 2. **Expert usage logging.** Done: routing is broad (90% of experts used), and the hot set is general, not workload-specific.
 3. **Tiered cache.** mmap streaming and router-driven prefetch: done and working. Hot experts in VRAM: works but gains only 8% and is unstable, because the per-layer handoff dominates.
-4. **Smaller experts and native Windows.** Done: Q2_K experts on native Vulkan is the best setup.
-5. **Quality check.** KL fidelity, two public benchmarks and a blind listening test: done for Q4_K, IQ4_XS, Q3_K, IQ3_S and Q2_K experts.
-6. **Batch paragraphs.** Not started.
+4. **Smaller experts and native Windows.** Done: native Vulkan beats CUDA in WSL, and Q2_K experts are the fast, low-RAM option.
+5. **Quality check.** KL fidelity, two public benchmarks and two blind listening tests (the second with a fixed voice file): done. Q4_K is the quality default.
+6. **Q4_K speed.** Done: fused audio decoder, VRAM spill fix, freed VRAM, flash attention. 0.77× for one take.
+7. **Batch takes.** Done as concurrent streams: four takes at once give 1.24–1.27× realtime throughput.
 
-Next: what the listening issues are (prosody, artifacts, pacing) and reference-voice files; an importance matrix for the IQ quants; KL on more sentences; Q2_K with prefetch under an 8 GB cap.
+Next: in-between expert mixes (IQ4_XS, Q2_K on only some layers, an imatrix) to find where speed stops costing intonation; KL on more sentences; a native Windows CUDA build to compare with Vulkan.
 
 ## Licence note
 

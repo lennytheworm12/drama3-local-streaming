@@ -1,6 +1,6 @@
 # Results
 
-Measured 2026-10-19 on one PC: RTX 4060 Ti 8 GB, Ryzen 7 5700 (8C/16T), 32 GB DDR4, Crucial P3 2 TB (QLC, DRAM-less
+Measured 2026-10-19 and 20 on one PC: RTX 4060 Ti 8 GB, Ryzen 7 5700 (8C/16T), 32 GB DDR4, Crucial P3 2 TB (QLC, DRAM-less
 NVMe), Windows 11 with WSL2 Ubuntu 22.04 (memory=28GB, swap=0). Model: Fish Audio Drama 3, 35B-A3B, the published Q4_K
 GGUF (20.8 GB) and our expert-quant variants made from the published F16. Runtime: speech.cpp main at `eacabcd` plus the
 [patches](patches/). Method and pass/fail criteria: [docs/test-plan.md](docs/test-plan.md).
@@ -10,9 +10,11 @@ automatic MOS predictor (1–5).
 
 ## Summary
 
-**Best setup on this PC: native Windows Vulkan, mmap loader with prefetch, Q2_K routed experts. 0.70× realtime, ready in
-11 s, 7.4 GB of RAM.** That is +60% over the stock build under WSL (0.44×) and +12% over the stock Windows release
-(0.63×), at half the RAM. [`narrate.cmd`](narrate.cmd) uses it.
+**Best setup on this PC: native Windows Vulkan with the published Q4_K, the fused audio decoder, half-precision caches
+sized for a line, `token_embd` on the CPU and flash attention.** One take runs at **0.77× realtime** with 8 layers' experts
+on the GPU (stock under WSL: 0.44×). Four takes side by side, every expert on the CPU, give **1.24–1.27× realtime
+throughput**. [`narrate.cmd`](narrate.cmd) uses the four-stream setup by default. Q2_K experts remain the
+low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voice found they flatten intonation.
 
 1. **mmap loader: worker ready in seconds, not minutes, at a fraction of the RAM.** 8.6 s warm / 57 s cold against
    224–302 s, 0.5 GB of anonymous memory against 16.4 GB, bit-identical output, and it runs under a 16 GB cap where the
@@ -22,11 +24,16 @@ automatic MOS predictor (1–5).
    layers fit in VRAM) and a cheaper handoff (native Windows instead of WSL) do.
 3. **SSD streaming works but costs speed**, and router-driven prefetch recovers most of it: 1.5–2.25× faster under a
    RAM cap, with 7× fewer page faults.
-4. **Q2_K experts are the best trade**: 1.4× faster at 55% of the RAM, for about +0.6 WER points in English and +1.7
-   kana-CER points in Japanese. Bi's blind listening test rated it highest of five builds. Plain Q3_K (no imatrix) was
-   worst on both public benchmarks and the listening test despite a lower KL.
+4. **Q2_K experts: 1.4× faster at 55% of the RAM, but they cost intonation.** About +0.6 WER points in English and +1.7
+   kana-CER points in Japanese. The first blind test (random voices) rated Q2_K highest; the second (one fixed voice)
+   preferred Q4_K, 69% against 44% "would watch", and every one of Bi's notes was on a Q2_K take. Q4_K is the quality
+   default. Plain Q3_K (no imatrix) was worst on both public benchmarks and the first listening test.
 5. **Expert routing is broad**: 90% of experts are used and the hot set is not workload-specific, so there is no small
    subset to prune or pin.
+6. **Several takes at once was held back by VRAM, not by the GPU.** Freeing 1.6 GB per stream (F16 cache, caches sized
+   for a line, `token_embd` on the CPU) took two streams from 0.80× to 0.98× and made room for four (1.27×).
+7. **Many things didn't help**: CPU expert repacking, one graph per frame, op fusion, Vulkan driver switches, Q8_0
+   (5–6× slower) and self-draft speculative decoding (about 5% acceptance).
 
 | setup | RTFx | ready | RAM | GPU expert layers |
 |---|---|---|---|---|
@@ -34,7 +41,10 @@ automatic MOS predictor (1–5).
 | mmap build, CUDA in WSL, Q4_K | 0.50 | 18 s | 14.6 GB (file-backed) | 4 |
 | stock v0.8.10 release, Vulkan on Windows, Q4_K | 0.63 | 44 s | 15.2 GB | 5 |
 | patched, Vulkan on Windows, Q4_K, mmap + prefetch | 0.65 | 15 s | 14.2 GB | 5 |
-| **patched, Vulkan on Windows, Q2_K experts, mmap + prefetch** | **0.70** | **11 s** | **7.4 GB** | 9 |
+| patched, Vulkan on Windows, Q2_K experts, mmap + prefetch | 0.70 | 11 s | 7.4 GB | 9 |
+| + fused decoder, Q4_K | 0.69 | | | 4 |
+| **+ freed VRAM and flash attention, Q4_K, one take** | **0.77** | | | 8 |
+| **+ four takes at once, Q4_K (throughput)** | **1.24–1.27** | about 25 s | | 0 |
 
 ## Step 1: baseline
 
@@ -190,6 +200,106 @@ The first Win32 mmap opened the file with `FILE_FLAG_RANDOM_ACCESS`, which disab
 per page. Dropping the flag and calling `PrefetchVirtualMemory` on the view (llama.cpp's approach) made mmap faster than
 fread. With Q2_K, 9 expert layers fit on the GPU instead of 5, and text-model time drops from 52 to 40 ms per frame.
 
+## Q4_K speed work on native Windows
+
+After the second listening test made Q4_K the quality default, the work turned to making Q4_K itself faster. All of it is
+native Vulkan, built into `build-vk3` with [`scorecard/tools/build_win3.cmd`](scorecard/tools/build_win3.cmd).
+
+### Where a frame goes
+
+`GGML_SCHED_TIMING=1` (Q4_K, 4 GPU expert layers, about 1,000 graphs, synchronised per split):
+
+- GPU compute: 37 splits × 0.50 ms ≈ 18.5 ms. Attention or DeltaNet, router and shared expert, each a tiny one-row dispatch.
+- CPU compute: 36 × 0.60 ms ≈ 21.7 ms of routed experts, near DDR4 bandwidth.
+- Copies: 0.12 + 0.16 ms per split ≈ 10 ms, about 20%.
+
+The GPU profile (`GGML_VK_PERF_LOGGER`, summarised by [`vk_perf_sum.py`](scorecard/tools/vk_perf_sum.py)) shows about
+2,400 ops and 37 ms of GPU time a frame. Matrix-vector products are about 60% of it, at roughly a quarter of the card's
+bandwidth because each is small (the m=512 k=2048 Q4_K products take 31 µs each, 126 a frame). Small elementwise ops are
+most of the rest, at 5–15 µs each. That kernel-efficiency limit is in ggml, not in our graphs.
+
+### VRAM spill and the GPU-layer cap
+
+With other GPU apps open (about +450 MiB of VRAM), the automatic expert placement overcommitted VRAM. Windows then paged
+buffers out: the codec went from 2.5 to 28 ms per frame and overall speed halved (0.65× → 0.35×). `SPEECH_GPU_EXPERT_LAYERS=n`
+caps the layers; with n=4 the codec was back to 2.4 ms and speed to 0.60–0.64× with those apps still open. This was also
+why a voice file had seemed to cost speed (0.47×): with the cap, 0.636× with the voice against 0.635× without. Under that
+memory pressure the mmap path also suffers (Windows trims mapped pages) while fread holds up, so narrate.py now uses fread.
+
+### Fused audio decoder
+
+`SPEECH_FUSED_DECODER=1` puts the decoder's 9 codebook graphs in one and samples on the GPU (argsort top-k, cumsum, step,
+one-hot embedding mix). Decoder 11.8 → 8.8 ms per frame, **0.658× → 0.688×**. All 10 sampled takes were bit-identical to
+the CPU-sampled path, and top_k=1 too. Adopted.
+
+### Concurrent takes (`SPEECH_STREAMS`)
+
+A pool of synthesizers over the one copy of the weights, each with its own Vulkan and CPU backend, so one take's CPU
+experts overlap another's GPU layers. The worker runs n requests at once.
+
+The first try lost (0.50–0.61× for two streams against 0.70× for one): the codec waited behind the other stream's
+dispatches and VRAM peaked at 7.5 GB. With the desktop's VRAM lower, two streams × 4 threads with every expert on the CPU
+reached 0.79–0.81×, +17% over the best single stream. Three streams ran out of VRAM.
+
+### Freeing VRAM
+
+One stream, every expert on the CPU, measured after warm-up:
+
+| change | VRAM used | saved |
+|---|---|---|
+| baseline | 4.92 GB | — |
+| `SPEECH_KV_F16=1`: keys and values in half precision | 4.46 GB | 0.46 GB |
+| + `SPEECH_MAX_PROMPT_ROWS=2048 SPEECH_MAX_FRAMES=1024`: caches and graph buffers for a line instead of 8,192 + 2,048 rows | 3.58 GB | 0.88 GB |
+| + `SPEECH_EMBD_ON_CPU=1`: the 0.3 GB `token_embd` in RAM, its row decoded on the CPU | 3.30 GB | 0.28 GB |
+
+The F16 cache's teacher-forced KL against F32 was 0.001–0.003 nats on the main token and under 0.001 on the codebooks, with
+92–98% top-1 agreement. Spending the freed memory: two streams went from 0.79–0.81× to **0.98×**, and three streams, out of
+VRAM before, reached **1.15×**. Multi-stream had been held back by VRAM, not by the GPU's dispatch latency.
+
+The cost: prompts over 2,048 rows are refused. A line's prompt with the voice file is about 400 rows, so a script needs
+one sentence or short paragraph per line.
+
+### Flash attention
+
+`SPEECH_FLASH_ATTN=1` (with the F16 cache, F32 accumulation): text model 52.8 → 48.0 ms and decoder 9.6 → 9.0 ms per frame,
+**−5.5 ms (−8%)**, at a KL of 0.003–0.005 against the F16 cache. Adopted.
+
+### Final sweep
+
+Flash attention plus all the VRAM switches. `SPEECH_GPU_EXPERT_LAYERS_EXACT=n` places exactly n layers' experts on the GPU,
+because the automatic estimate does not see the smaller caches.
+
+| setup | throughput | VRAM peak |
+|---|---|---|
+| 1 stream, 6 GPU expert layers | 0.733× | 6.4 GB |
+| **1 stream, 8 layers** | **0.769×** | 7.3 GB |
+| 2 streams × 4 threads, 4 layers | 1.08× | 6.5 GB |
+| 3 streams × 3 threads, 0 / 2 layers | 1.14× / 1.20× | 5.7 / 6.6 GB |
+| **4 streams × 2 threads, 0 layers** | **1.27× / 1.24×** (two runs) | 6.6 GB |
+| 4 streams × 3 threads | 1.22× | 6.6 GB |
+| 4 streams × 2 threads, 1 layer | 1.27× | 7.1 GB |
+| 5 streams × 2 threads | 1.16× | 7.5 GB |
+
+narrate.py defaults to 4 streams × 2 threads with every expert on the CPU, and `--streams 1` uses 6 GPU layers to leave
+headroom for other apps. The four-line cold open, 2 takes a line with the voice file, took 114 s including load (163 s
+before).
+
+### Tried and rejected
+
+| change | result |
+|---|---|
+| CPU repack (`SPEECH_CPU_REPACK=1`: Q4_K experts in ggml's AVX2 8×8 interleaved layout, as llama.cpp does) | 0.597× against 0.593×. The CPU expert step is not limited by matmul kernel efficiency. |
+| Q8_0 (38.5 GB, streamed through mmap) | 0.107–0.132×, 5–6× slower than Q4_K; 40 CPU layers of 8-bit experts at about 294 ms per frame. Not viable on this card, and upstream's CER shows Q8_0 ≈ Q4_K anyway. |
+| Audio decoder on the CPU (`SPEECH_DECODER_ON_CPU=1`) | 22.6 ms per frame against 9.25 ms on the GPU, to free 1.4 GB. |
+| ggml Vulkan switches (FORCE_MMVQ, ASYNC_USE_TRANSFER_QUEUE, MAX_NODES_PER_SUBMIT=1000, DISABLE_FUSION) | 0.684–0.689× against 0.688×. No effect. |
+| Speculative decoding with a self-draft (`SPEECH_SKIP_CPU_EXPERTS=1`: CPU-held layers keep only the shared expert) | Expected acceptance about 5% (main-token top-1 agreement 0%, KL 4.1–4.4 nats) for a draft only 1.5× faster. It would need a trained draft or MTP heads. |
+| One submission per frame (`SPEECH_ONE_GRAPH=1`: decoder, embedding, text model and head in one scheduled graph) | Bit-identical, but 64.7 against 64.5 ms per frame. Graph launches were not the cost; the 73 scheduler splits a frame stay either way. |
+| Op fusion (`SPEECH_FUSE_OPS=1`: router in llama.cpp's node order for Vulkan's topk_moe kernel, swiglu as one node) | 53.2 against 52.8 ms. Fusing the router lost the sigmoid-mul and multi-add fusions, and the router was about 2% of GPU time. |
+
+The floor for a single take on this rig is about 60 ms per frame: CPU experts about 22 ms, GPU dispatches about 18 ms,
+copies about 10 ms, decoder about 9 ms, codec about 2.5 ms. Going lower needs a bigger GPU (more expert layers, fewer
+handoffs) or a change to the model's arithmetic.
+
 ## Expert prefetch from the router (`SPEECH_PREFETCH_EXPERTS`)
 
 A CPU custom op passes the router's picks through and asks the OS to read the chosen experts' slices
@@ -235,7 +345,7 @@ published table), voice `none` (upstream's reference voice is not published). CE
 
 On both, plain Q3_K came out worse than Q2_K despite its lower KL. IQ4_XS is equivalent to Q4_K.
 
-## Blind listening test
+## First blind listening test
 
 6 sentences × 5 builds, seed 1, voice `none`, takes labelled A–E and shuffled per sentence, scored 1–5 by Bi before
 seeing the key.
@@ -254,11 +364,30 @@ seeing the key.
 - Scores overall are middling (2.3–3.5, "noticeable issue but usable"): voice `none` English from this model is not
   narrator-grade to Bi's ear whatever the build. Q2_K's higher KL is not audible as worse in this sample.
 
+## Second listening test: fixed voice, Q4_K against Q2_K
+
+The voice was cast from 15 generated candidates. Bi starred 3, and the clear female storyteller (seed 4) was made into a
+voice file with `speech voice`. It holds: ECAPA similarity to the reference is 0.77 with the file against 0.15 without.
+4 sentences × 4 seeds × 2 builds = 32 blind takes, rated "would watch" plus 1–5.
+
+| build | would watch | mean score | 4+ |
+|---|---|---|---|
+| **Q4_K (published)** | **11/16 = 69%** | 3.31 | 6 |
+| Q2_K experts | 7/16 = 44% | 3.19 | 4 |
+
+- Fisher exact p = 0.29, so not significant at 16 takes each, but the direction favours Q4_K.
+- All three of Bi's notes were on Q2_K takes: "too much upwards tone at the end of each word" (twice) and "too monotone".
+  That is an intonation defect, consistent with Q2_K's 2.8× KL. The first test's preference for Q2_K was voice luck.
+- A fixed voice raised the watch rate from about 20% (first test, random voices) to 56%.
+- The voice file lengthens every chunk's prompt. Before the VRAM fixes it cost speed (Q4_K 0.654× → 0.468×); with the
+  GPU-layer cap it costs nothing measurable.
+
 ## What it means, and what's next
 
-- Use the mmap loader. It starts in seconds, halves RAM, and can run next to other GPU apps.
-- On an 8 GB card the ceiling is set by the CPU-layer handoff. Real speedups need fewer CPU layers (smaller expert
-  quants, more VRAM) or a cheaper handoff (native Windows; fused CPU kernels or asynchronous overlap in the scheduler).
-  Moving individual experts doesn't help.
-- Next: find what the listening issues are (prosody, artifacts, pacing) and test reference-voice files; an importance
-  matrix for the IQ quants; KL on more sentences; Q2_K + prefetch under an 8 GB cap; a better next-layer predictor.
+- Q4_K is the quality default and Q2_K the speed and low-RAM option.
+- On an 8 GB card a single take is near its floor (0.77×). Throughput comes from running takes side by side, which
+  suits narration, since several takes per line are wanted anyway.
+- Use the mmap loader when RAM is short; fread is steadier when other apps press on memory on Windows.
+- Next: in-between expert mixes (IQ4_XS, Q2_K on only some layers, an imatrix) to find where speed stops costing
+  intonation, judged by KL first and then by ear; KL on more sentences; a CUDA build on native Windows to compare
+  with Vulkan.
