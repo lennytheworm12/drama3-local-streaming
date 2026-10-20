@@ -1,0 +1,107 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index ffbcba36..98715dd9 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <chrono>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -1862,16 +1863,43 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     }
+ }
+ 
++// speech.cpp experiment (GGML_SCHED_TIMING=1): where a scheduled graph's time goes, per backend: copying a split's
++// inputs, and its compute (synchronized after each split, so the attribution is exact but overlap is lost).
++// Prints totals every 500 graphs to stderr.
++struct sched_timing {
++    bool on = getenv("GGML_SCHED_TIMING") != nullptr;
++    double copy_ms[GGML_SCHED_MAX_BACKENDS] = {0}, compute_ms[GGML_SCHED_MAX_BACKENDS] = {0};
++    long splits[GGML_SCHED_MAX_BACKENDS] = {0};
++    long graphs = 0;
++};
++static sched_timing g_sched_timing;
++static double sched_now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+ 
+     int prev_backend_id = -1;
++    sched_timing & tm = g_sched_timing;
++    // speech.cpp experiment (GGML_SCHED_SPLITS=n): the splits of the first n graphs, backend initial and nodes of each.
++    static const long show_splits = getenv("GGML_SCHED_SPLITS") ? atol(getenv("GGML_SCHED_SPLITS")) : 0;
++    static long shown = 0;
++    if (shown < show_splits) {
++        shown++;
++        fprintf(stderr, "sched-splits: graph %ld, %d splits:", shown, sched->n_splits);
++        for (int i = 0; i < sched->n_splits; i++) {
++            fprintf(stderr, " %c%d/%d", ggml_backend_name(sched->backends[splits[i].backend_id])[0], splits[i].i_end - splits[i].i_start, splits[i].n_inputs);
++        }
++        fprintf(stderr, "\n");
++    }
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
++        const double t_start = tm.on ? sched_now_ms() : 0;
+ 
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+@@ -1897,10 +1925,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         if (!sched->callback_eval) {
++            const double t_copied = tm.on ? sched_now_ms() : 0;
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            if (tm.on) {
++                ggml_backend_synchronize(split_backend);
++                tm.copy_ms[split_backend_id] += t_copied - t_start;
++                tm.compute_ms[split_backend_id] += sched_now_ms() - t_copied;
++                tm.splits[split_backend_id]++;
++            }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+@@ -1943,6 +1978,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    if (tm.on && ++tm.graphs % 500 == 0) {
++        for (int b = 0; b < sched->n_backends; b++) {
++            fprintf(stderr, "sched-timing: %ld graphs, %s: %ld splits (%.1f per graph), copy %.3f ms/graph, compute %.3f ms/graph, per split copy %.3f compute %.3f ms\n",
++                    tm.graphs, ggml_backend_name(sched->backends[b]), tm.splits[b], (double) tm.splits[b] / tm.graphs,
++                    tm.copy_ms[b] / tm.graphs, tm.compute_ms[b] / tm.graphs,
++                    tm.splits[b] ? tm.copy_ms[b] / tm.splits[b] : 0.0, tm.splits[b] ? tm.compute_ms[b] / tm.splits[b] : 0.0);
++        }
++    }
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index ab82e3d6..b42a05b9 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1652,6 +1652,13 @@ static void ggml_compute_forward_mul_mat_id(
+             for (int id = 0; id < n_ids; ++id) {
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
++                // speech.cpp experiment (hot experts on the GPU): an id of -1 is a pick another backend computes; its
++                // row of the result is 0 and costs nothing here.
++                if (i02 < 0) {
++                    memset((char *) dst->data + id*dst->nb[1] + iid1*dst->nb[2], 0, dst->ne[0]*sizeof(float));
++                    continue;
++                }
++
+                 assert(i02 >= 0 && i02 < n_as);
+ 
+                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
