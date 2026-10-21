@@ -1,3 +1,15 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8116ee..68f80a0 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -39,6 +39,7 @@ add_library(speechcommon STATIC
+     src/common/model-file.cpp
+     src/common/storage.cpp
+     src/common/quantize.cpp
++    src/common/imatrix.cpp
+     src/common/backend.cpp
+     src/common/wav.cpp
+     src/common/args.cpp
 diff --git a/src/api/request.cpp b/src/api/request.cpp
 index 5e5476c..02436f4 100644
 --- a/src/api/request.cpp
@@ -13,6 +25,254 @@ index 5e5476c..02436f4 100644
          spend(*request, run, [&] {
              if (!run.stopped()) result->stop = request->model->engine->speak(*request->text, values, run);
          });
+diff --git a/src/common/imatrix.cpp b/src/common/imatrix.cpp
+new file mode 100755
+index 0000000..beac265
+--- /dev/null
++++ b/src/common/imatrix.cpp
+@@ -0,0 +1,193 @@
++#include "imatrix.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++
++#include "ggml-backend.h"
++
++namespace {
++
++constexpr char kMagic[4] = {'S', 'I', 'M', 'X'};
++
++template <typename T>
++bool get(FILE * f, T & v) {
++    return std::fread(&v, sizeof v, 1, f) == 1;
++}
++
++/** The importance matrix this process collects, saved where SPEECH_IMATRIX_OUT names when the process ends. */
++struct Collector {
++    std::mutex mutex;
++    Imatrix matrix;
++    std::string path;
++    std::vector<uint8_t> buffer;
++    int64_t calls = 0;
++
++    Collector() {
++        if (const char * p = std::getenv("SPEECH_IMATRIX_OUT"); p && *p) path = p;
++    }
++    ~Collector() {
++        if (path.empty() || calls == 0) return;
++        try {
++            Imatrix total;
++            total.load(path);
++            for (auto & [name, e] : matrix.entries) {
++                Imatrix::Entry & t = total.entries[name];
++                if (t.rows.empty()) {
++                    t = e;
++                    continue;
++                }
++                if (t.channels != e.channels || t.rows.size() != e.rows.size()) {
++                    std::fprintf(stderr, "imatrix: %s changed shape; keeping the new run only\n", name.c_str());
++                    t = e;
++                    continue;
++                }
++                for (size_t i = 0; i < e.rows.size(); i++) t.rows[i] += e.rows[i];
++                for (size_t i = 0; i < e.sums.size(); i++) t.sums[i] += e.sums[i];
++            }
++            total.save(path);
++            std::fprintf(stderr, "imatrix: %lld products added, %zu matrices in %s\n", (long long) calls, total.entries.size(), path.c_str());
++        } catch (const std::exception & ex) {
++            std::fprintf(stderr, "imatrix: cannot save %s: %s\n", path.c_str(), ex.what());
++        }
++    }
++};
++
++Collector & collector() {
++    static Collector c;
++    return c;
++}
++
++/** The value at row `r1`, plane `r2` of a float32 tensor whose bytes `data` holds, channel `k`. */
++inline float at(const uint8_t * data, const ggml_tensor * t, int64_t k, int64_t r1, int64_t r2, int64_t r3 = 0) {
++    float v;
++    std::memcpy(&v, data + k * t->nb[0] + r1 * t->nb[1] + r2 * t->nb[2] + r3 * t->nb[3], sizeof v);
++    return v;
++}
++
++}  // namespace
++
++void Imatrix::load(const std::string & path) {
++    FILE * f = std::fopen(path.c_str(), "rb");
++    if (!f) return;
++    char magic[4];
++    uint32_t version = 0, n = 0;
++    if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, kMagic, 4) != 0 || !get(f, version) || version != 1 || !get(f, n)) {
++        std::fclose(f);
++        throw std::runtime_error(path + " is not an importance matrix of version 1");
++    }
++    for (uint32_t i = 0; i < n; i++) {
++        uint32_t len = 0, mats = 0, channels = 0;
++        if (!get(f, len) || len > 4096) break;
++        std::string name(len, '\0');
++        Entry e;
++        bool ok = std::fread(name.data(), 1, len, f) == len && get(f, mats) && get(f, channels);
++        if (ok) {
++            e.channels = channels;
++            e.rows.resize(mats);
++            std::vector<float> sums((size_t) mats * channels);
++            ok = std::fread(e.rows.data(), sizeof(int64_t), mats, f) == mats && std::fread(sums.data(), sizeof(float), sums.size(), f) == sums.size();
++            e.sums.assign(sums.begin(), sums.end());
++        }
++        if (!ok) {
++            std::fclose(f);
++            throw std::runtime_error(path + " ends inside entry " + std::to_string(i));
++        }
++        Entry & into = entries[name];
++        if (into.rows.empty()) {
++            into = std::move(e);
++        } else if (into.channels == e.channels && into.rows.size() == e.rows.size()) {
++            for (size_t r = 0; r < e.rows.size(); r++) into.rows[r] += e.rows[r];
++            for (size_t s = 0; s < e.sums.size(); s++) into.sums[s] += e.sums[s];
++        }
++    }
++    std::fclose(f);
++}
++
++void Imatrix::save(const std::string & path) const {
++    const std::string tmp = path + ".tmp";
++    FILE * f = std::fopen(tmp.c_str(), "wb");
++    if (!f) throw std::runtime_error("cannot create " + tmp);
++    const uint32_t version = 1, n = (uint32_t) entries.size();
++    bool ok = std::fwrite(kMagic, 1, 4, f) == 4 && std::fwrite(&version, 4, 1, f) == 1 && std::fwrite(&n, 4, 1, f) == 1;
++    for (const auto & [name, e] : entries) {
++        const uint32_t len = (uint32_t) name.size(), mats = (uint32_t) e.rows.size(), channels = (uint32_t) e.channels;
++        const std::vector<float> sums(e.sums.begin(), e.sums.end());
++        ok = ok && std::fwrite(&len, 4, 1, f) == 1 && std::fwrite(name.data(), 1, len, f) == len && std::fwrite(&mats, 4, 1, f) == 1 &&
++             std::fwrite(&channels, 4, 1, f) == 1 && std::fwrite(e.rows.data(), sizeof(int64_t), mats, f) == mats &&
++             std::fwrite(sums.data(), sizeof(float), sums.size(), f) == sums.size();
++    }
++    ok = std::fclose(f) == 0 && ok;
++    if (!ok) throw std::runtime_error("cannot write " + tmp);
++    std::remove(path.c_str());
++    if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("cannot rename " + tmp + " to " + path);
++}
++
++std::vector<float> Imatrix::weights(const std::string & name, int index, int64_t channels) const {
++    const auto it = entries.find(name);
++    if (it == entries.end() || it->second.channels != channels || index < 0 || index >= (int) it->second.rows.size()) return {};
++    const Entry & e = it->second;
++    const int64_t rows = e.rows[(size_t) index];
++    if (rows <= 0) return {};
++    std::vector<float> w((size_t) channels);
++    for (int64_t k = 0; k < channels; k++) w[(size_t) k] = (float) (e.sums[(size_t) (index * channels + k)] / (double) rows);
++    return w;
++}
++
++bool imatrix_collecting() {
++    return !collector().path.empty();
++}
++
++bool imatrix_collect(ggml_tensor * t, bool ask, void *) {
++    const bool product = t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID;
++    const ggml_tensor * w = product ? t->src[0] : nullptr;
++    // Only the file's weights: named, and not the intermediate products of attention.
++    const bool weight = w && std::strncmp(w->name, "blk.", 4) == 0 && w->op == GGML_OP_NONE;
++    if (ask) return weight;
++    if (!weight) return true;
++    const ggml_tensor * x = t->src[1];
++    if (x->type != GGML_TYPE_F32) return true;
++    Collector & c = collector();
++    std::lock_guard<std::mutex> lock(c.mutex);
++    c.buffer.resize(ggml_nbytes(x));
++    ggml_backend_tensor_get(const_cast<ggml_tensor *>(x), c.buffer.data(), 0, c.buffer.size());
++    const int64_t channels = x->ne[0];
++    const int mats = t->op == GGML_OP_MUL_MAT_ID ? (int) w->ne[2] : 1;
++    Imatrix::Entry & e = c.matrix.entries[w->name];
++    if (e.rows.empty()) {
++        e.channels = channels;
++        e.rows.assign((size_t) mats, 0);
++        e.sums.assign((size_t) mats * channels, 0.0);
++    }
++    if (e.channels != channels || (int) e.rows.size() != mats) return true;
++    if (t->op == GGML_OP_MUL_MAT) {
++        for (int64_t r3 = 0; r3 < x->ne[3]; r3++)
++            for (int64_t r2 = 0; r2 < x->ne[2]; r2++)
++                for (int64_t r1 = 0; r1 < x->ne[1]; r1++) {
++                    for (int64_t k = 0; k < channels; k++) {
++                        const float v = at(c.buffer.data(), x, k, r1, r2, r3);
++                        e.sums[(size_t) k] += (double) v * v;
++                    }
++                    e.rows[0]++;
++                }
++    } else {
++        // ids [used, tokens]; the input of pick j of token i is row j % ne1 of plane i.
++        const ggml_tensor * ids = t->src[2];
++        std::vector<int32_t> id((size_t) ggml_nelements(ids));
++        if (!ggml_is_contiguous(ids)) return true;
++        ggml_backend_tensor_get(const_cast<ggml_tensor *>(ids), id.data(), 0, id.size() * sizeof(int32_t));
++        for (int64_t i = 0; i < ids->ne[1]; i++)
++            for (int64_t j = 0; j < ids->ne[0]; j++) {
++                const int32_t ex = id[(size_t) (i * ids->ne[0] + j)];
++                if (ex < 0 || ex >= mats) continue;
++                for (int64_t k = 0; k < channels; k++) {
++                    const float v = at(c.buffer.data(), x, k, j % x->ne[1], i);
++                    e.sums[(size_t) (ex * channels + k)] += (double) v * v;
++                }
++                e.rows[(size_t) ex]++;
++            }
++    }
++    c.calls++;
++    return true;
++}
+diff --git a/src/common/imatrix.h b/src/common/imatrix.h
+new file mode 100755
+index 0000000..d0c8d12
+--- /dev/null
++++ b/src/common/imatrix.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "ggml.h"
++
++/**
++ * Experiment: an importance matrix, the mean square of each input channel a weight matrix multiplies, per matrix (and
++ * per expert of a stacked expert tensor), which ggml's quantizers take to weigh their rounding error.
++ *
++ * File (little-endian): "SIMX", u32 version 1, u32 entries; each entry: u32 name bytes, name, u32 matrices, u32 channels,
++ * then matrices i64 row counts, then matrices x channels f32 sums of squares. Sums, not means, so that runs add up.
++ */
++struct Imatrix {
++    struct Entry {
++        int64_t channels = 0;
++        std::vector<int64_t> rows;  // per matrix
++        std::vector<double> sums;   // [matrices][channels]
++    };
++    std::map<std::string, Entry> entries;
++
++    /** Adds the file at `path` to this one; a missing file adds nothing. Throws on a malformed file. */
++    void load(const std::string & path);
++    void save(const std::string & path) const;
++
++    /**
++     * The weights for matrix `index` of the tensor `name`, `channels` of them: the mean square of each channel, or empty
++     * where the tensor has no entry or that matrix saw no row.
++     */
++    std::vector<float> weights(const std::string & name, int index, int64_t channels) const;
++};
++
++/**
++ * Experiment (SPEECH_IMATRIX_OUT=path): a scheduler eval callback that accumulates every MUL_MAT and MUL_MAT_ID of a
++ * named weight into the importance matrix of the process, which is saved to `path` (adding to what it held) at exit.
++ */
++bool imatrix_collect(ggml_tensor * t, bool ask, void * user_data);
++/** Whether SPEECH_IMATRIX_OUT is set. */
++bool imatrix_collecting();
 diff --git a/src/common/model-file.cpp b/src/common/model-file.cpp
 index d2b1102..0be81f4 100644
 --- a/src/common/model-file.cpp
@@ -294,10 +554,57 @@ index 31cbf4f..9fa7a6c 100644
      std::vector<std::unique_ptr<ggml_context, decltype(&ggml_free)>> kept_;
      /**
 diff --git a/src/common/quantize.cpp b/src/common/quantize.cpp
-index 2c98723..868226a 100644
+index 2c98723..cb0b4da 100644
 --- a/src/common/quantize.cpp
 +++ b/src/common/quantize.cpp
-@@ -193,6 +193,17 @@ void write_bytes(FILE * f, const std::vector<uint8_t> & bytes, const std::string
+@@ -14,6 +14,7 @@
+ #include <vector>
+ 
+ #include "error.h"
++#include "imatrix.h"
+ #include "gguf.h"
+ #include "log.h"
+ 
+@@ -161,9 +162,37 @@ struct Workers {
+  * Converts `values`, rows of `row` values, to `type`, the rows spread over the machine's threads; ggml converts each row
+  * on its own, so the bytes do not depend on the threads.
+  */
+-std::vector<uint8_t> convert(const std::vector<float> & values, int64_t row, ggml_type type) {
++std::vector<uint8_t> convert(const std::vector<float> & values, int64_t row, ggml_type type, const ggml_tensor * t = nullptr,
++                             const Imatrix * imatrix = nullptr) {
+     const int64_t rows = (int64_t) values.size() / row;
+     std::vector<uint8_t> out(ggml_row_size(type, row) * rows);
++    // Experiment (SPEECH_QUANT_IMATRIX): each matrix of the tensor, an expert of a stacked tensor or the whole of a 2D one,
++    // quantized with its channels' mean squares as the weights of the rounding error; a matrix without them, without.
++    if (imatrix && t && ggml_is_quantized(type)) {
++        const int64_t per = t->ne[1], mats = rows / per;
++        int64_t weighted = 0;
++        // Per matrix: its channels' mean squares, or none.
++        std::vector<std::vector<float>> w((size_t) mats);
++        for (int64_t m = 0; m < mats; m++) {
++            w[(size_t) m] = imatrix->weights(t->name, (int) m, row);
++            weighted += !w[(size_t) m].empty();
++        }
++        const int64_t threads = std::max<int64_t>(1, std::min<int64_t>(std::thread::hardware_concurrency(), mats));
++        {
++            // Joined at the end of this block, before `out` is returned.
++            Workers workers;
++            for (int64_t th = 0; th < threads; th++) {
++                workers.threads.emplace_back([&, th] {
++                    for (int64_t m = th; m < mats; m += threads) {
++                        const float * qw = w[(size_t) m].empty() ? nullptr : w[(size_t) m].data();
++                        ggml_quantize_chunk(type, values.data(), out.data(), m * per * row, per, row, qw);
++                    }
++                });
++            }
++        }
++        if (weighted < mats) std::fprintf(stderr, "imatrix: %s: %lld of %lld matrices weighted\n", t->name, (long long) weighted, (long long) mats);
++        return out;
++    }
+     const int64_t threads = std::max<int64_t>(1, std::min<int64_t>(std::thread::hardware_concurrency(), rows));
+     {
+         Workers workers;
+@@ -193,6 +222,17 @@ void write_bytes(FILE * f, const std::vector<uint8_t> & bytes, const std::string
   * would hold other bytes than the same type made of the F32 weights.
   */
  void require_f32(const gguf_context * gguf, const ModelIdentity & identity, const std::string & in, const Layout & layout) {
@@ -315,7 +622,7 @@ index 2c98723..868226a 100644
      int64_t other = -1;
      bool quantized = false;
      for (int64_t i = 0; i < gguf_get_n_tensors(gguf); i++) {
-@@ -244,6 +255,29 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+@@ -244,6 +284,29 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
      for (int64_t i = 0; i < n; i++) {
          const TensorSpec & spec = specs.at(gguf_get_tensor_name(gguf.get(), i));
          types[i] = spec.type_in(type.type);
@@ -345,7 +652,7 @@ index 2c98723..868226a 100644
          at_least(spec.first_release(types[i]));
          const ggml_tensor * t = ggml_get_tensor(meta_ctx.get(), spec.name.c_str());
          bytes_of[types[i]] += ggml_row_size(types[i], t->ne[0]) * (uint64_t) (ggml_nelements(t) / t->ne[0]);
-@@ -251,7 +285,8 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+@@ -251,7 +314,8 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
      // general.file_type names the type that holds most of the bytes, which a layout that keeps its tensors in F32, as
      // Silero VAD's does, would leave F32.
      const auto most = std::max_element(bytes_of.begin(), bytes_of.end(), [](const auto & a, const auto & b) { return a.second < b.second; });
@@ -355,7 +662,7 @@ index 2c98723..868226a 100644
          throw Error(Fault::InvalidArgument, in + " is a model of " + layout.architecture + ", whose layout keeps most of its weights in " +
                                                  tensor_type_text(most->first) + " in a file of " + tensor_type_text(type.type) + ", so speech quantize writes no " +
                                                  tensor_type_text(type.type) + " file of it; use the " + tensor_type_text(most->first) + " file as it is",
-@@ -310,12 +345,16 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+@@ -310,12 +374,16 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
      for (int64_t i = 0; i < n; i++) {
          const ggml_tensor * t = ggml_get_tensor(meta_ctx.get(), gguf_get_tensor_name(gguf.get(), i));
          values.resize(ggml_nelements(t));
@@ -374,6 +681,23 @@ index 2c98723..868226a 100644
          // ggml's quantizers assert that a value is finite where assertions are on and write garbage where they are off.
          const auto bad = std::find_if(values.begin(), values.end(), [](float v) { return !std::isfinite(v); });
          if (bad != values.end()) {
+@@ -324,7 +392,15 @@ void write_model_file(const std::string & in, const std::string & out, const Wei
+                             " at value " + std::to_string(bad - values.begin()) + ", which no weight of a model is; " + model->remedy(),
+                         "model_path");
+         }
+-        std::vector<uint8_t> data = convert(values, t->ne[0], types[i]);
++        static const Imatrix * imatrix = [] () -> const Imatrix * {
++            const char * p = std::getenv("SPEECH_QUANT_IMATRIX");
++            if (!p || !*p) return nullptr;
++            static Imatrix m;
++            m.load(p);
++            std::fprintf(stderr, "imatrix: %zu matrices from %s\n", m.entries.size(), p);
++            return &m;
++        }();
++        std::vector<uint8_t> data = convert(values, t->ne[0], types[i], t, imatrix);
+         pad(data, alignment);
+         write_bytes(target.get(), data, out);
+     }
 diff --git a/src/engines/drama3-engine.cpp b/src/engines/drama3-engine.cpp
 index d9885d2..a67018a 100644
 --- a/src/engines/drama3-engine.cpp
@@ -1178,10 +1502,10 @@ index c6bd7df..5f9d6b1 100644
      chunk.codes.resize((size_t) (codebooks * chunk.frames));
      for (int64_t f = 0; f < chunk.frames; f++)
 diff --git a/src/families/drama3/text-model.cpp b/src/families/drama3/text-model.cpp
-index d1ea780..bfc0914 100644
+index d1ea780..e0b4b68 100644
 --- a/src/families/drama3/text-model.cpp
 +++ b/src/families/drama3/text-model.cpp
-@@ -2,7 +2,19 @@
+@@ -2,9 +2,22 @@
  
  #include <algorithm>
  #include <cmath>
@@ -1200,8 +1524,11 @@ index d1ea780..bfc0914 100644
 +#endif
  
  #include "error.h"
++#include "imatrix.h"
  
-@@ -15,6 +27,18 @@ namespace {
+ namespace drama3 {
+ 
+@@ -15,6 +28,18 @@ namespace {
   * for a block of the longest prompt, 8,192 rows of 16 heads.
   */
  constexpr int64_t kBlockRows = 512;
@@ -1220,7 +1547,7 @@ index d1ea780..bfc0914 100644
  /** The epsilon of the official l2norm() of the Gated DeltaNet's queries and keys: x * rsqrt(sum(x^2) + 1e-6). */
  constexpr float kL2Eps = 1e-6f;
  
-@@ -22,6 +46,51 @@ std::string layer_name(int l) {
+@@ -22,6 +47,51 @@ std::string layer_name(int l) {
      return "blk." + std::to_string(l) + ".";
  }
  
@@ -1272,10 +1599,21 @@ index d1ea780..bfc0914 100644
  }  // namespace
  
  /**
-@@ -94,7 +163,109 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
+@@ -92,9 +162,119 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
+         ggml_backend_t backends[] = {backend_, cpu};
+         // Without offloading the prompt's experts to the GPU: copying a layer's experts over for a prompt of 46 rows
          // made it take 2.5 s where the CPU took 1.0 s, on an RTX 2080 with Vulkan and an i9-9900K (2026-10-15).
-         sched_ = ggml_backend_sched_new(backends, nullptr, 2, 32768, false, false);
+-        sched_ = ggml_backend_sched_new(backends, nullptr, 2, 32768, false, false);
++        // Experiment (SPEECH_SCHED_PINNED=1): the CPU's side of the scheduler in the device's pinned host memory, which
++        // the device reads and writes directly, as llama.cpp keeps it, instead of plain host memory staged through a copy.
++        ggml_backend_buffer_type_t bufts[] = {ggml_backend_get_default_buffer_type(backend_), nullptr};
++        const char * pinned = std::getenv("SPEECH_SCHED_PINNED");
++        if (pinned && *pinned == '1') bufts[1] = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend_));
++        if (!bufts[1]) bufts[1] = ggml_backend_get_default_buffer_type(cpu);
++        sched_ = ggml_backend_sched_new(backends, bufts, 2, 32768, false, false);
          if (!sched_) throw Error(Fault::OutOfMemory, "cannot create the scheduler of the text model's graphs");
++        // Experiment (SPEECH_IMATRIX_OUT): every product of a weight passes its input through the collector.
++        if (imatrix_collecting()) ggml_backend_sched_set_eval_callback(sched_, imatrix_collect, nullptr);
 +        if (const char * list = std::getenv("SPEECH_HOT_EXPERTS"); list && *list) load_hot_experts(cpu);
 +    }
 +}
@@ -1382,7 +1720,7 @@ index d1ea780..bfc0914 100644
  }
  
  TextModel::~TextModel() {
-@@ -195,20 +366,105 @@ ggml_tensor * TextModel::delta_mixer(Graph & g, int l, ggml_tensor * x) {
+@@ -195,25 +375,123 @@ ggml_tensor * TextModel::delta_mixer(Graph & g, int l, ggml_tensor * x) {
      return mul_mat(c, m_.tensor(p + "ssm_out"), ggml_reshape_2d(c, core, (int64_t) value_heads_ * value_dim_, n));
  }
  
@@ -1461,6 +1799,18 @@ index d1ea780..bfc0914 100644
 +            return ggml_mul(c, shared, ggml_sigmoid(c, mul_mat(c, m_.tensor(p + "ffn_gate_inp_shexp"), x)));
 +        }
 +    }
++    // Experiment (GGML_SCHED_EARLY=1): the shared expert built right after the router, ahead of the routed experts, so
++    // that it ends the device's part of the layer, which the scheduler then computes while the CPU computes the rest.
++    static const bool shared_first = std::getenv("GGML_SCHED_EARLY") != nullptr;
++    ggml_tensor * shared_early = nullptr;
++    if (shared_first) {
++        g.expand(chosen);
++        g.expand(weights);
++        shared_early = mul_mat(c, m_.tensor(p + "ffn_down_shexp"),
++                               ggml_mul(c, ggml_silu(c, mul_mat(c, m_.tensor(p + "ffn_gate_shexp"), x)), mul_mat(c, m_.tensor(p + "ffn_up_shexp"), x)));
++        shared_early = ggml_mul(c, shared_early, ggml_sigmoid(c, mul_mat(c, m_.tensor(p + "ffn_gate_inp_shexp"), x)));
++        g.expand(shared_early);
++    }
      ggml_tensor * rows = ggml_reshape_3d(c, x, h_, 1, n);
 -    ggml_tensor * gate = mul_mat_id(c, m_.tensor(p + "ffn_gate_exps"), rows, chosen);
 -    ggml_tensor * up = mul_mat_id(c, m_.tensor(p + "ffn_up_exps"), rows, chosen);
@@ -1492,7 +1842,13 @@ index d1ea780..bfc0914 100644
      ggml_tensor * sum = nullptr;
      for (int e = 0; e < used_; e++) {
          ggml_tensor * one = ggml_view_2d(c, down, h_, n, down->nb[2], (size_t) e * down->nb[1]);
-@@ -250,7 +506,20 @@ ggml_tensor * TextModel::build_embed(Graph & g, const std::vector<int32_t> & fra
+         sum = sum ? ggml_add(c, sum, one) : one;
+     }
++    if (shared_early) return ggml_add(c, sum, shared_early);
+     ggml_tensor * shared = mul_mat(c, m_.tensor(p + "ffn_down_shexp"),
+                                    ggml_mul(c, ggml_silu(c, mul_mat(c, m_.tensor(p + "ffn_gate_shexp"), x)), mul_mat(c, m_.tensor(p + "ffn_up_shexp"), x)));
+     shared = ggml_mul(c, shared, ggml_sigmoid(c, mul_mat(c, m_.tensor(p + "ffn_gate_inp_shexp"), x)));
+@@ -250,7 +528,20 @@ ggml_tensor * TextModel::build_embed(Graph & g, const std::vector<int32_t> & fra
          }
      }
      ggml_context * c = g.ctx();
@@ -1514,7 +1870,7 @@ index d1ea780..bfc0914 100644
      if (seen_ > 0) {
          ggml_tensor * rows = ggml_get_rows(c, m_.tensor("ad.codebook_embd"), g.input(seen, (int64_t) seen.size()));
          ggml_tensor * mixed = e;
-@@ -278,6 +547,20 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
+@@ -278,6 +569,20 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
                                       stages ? &kept : nullptr);
          if (sched_) g.compute(sched_);
          else g.compute(backend_, allocr_);
@@ -1535,7 +1891,7 @@ index d1ea780..bfc0914 100644
          if (stages) {
              for (int i = 0; i < count; i++) {
                  std::vector<float> * where[] = {&stages->mixer[(size_t) i], &stages->router[(size_t) i], &stages->moe[(size_t) i],
-@@ -298,6 +581,8 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
+@@ -298,6 +603,8 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
  ggml_tensor * TextModel::build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept) {
      ggml_context * c = g.ctx();
      const int64_t rows = x->ne[1];
@@ -1544,7 +1900,7 @@ index d1ea780..bfc0914 100644
      // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
      const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
      ggml_tensor * pos = attends ? positions(g, n_past_, rows) : nullptr;
-@@ -348,6 +633,43 @@ std::vector<float> TextModel::logits(const std::vector<float> & hidden) {
+@@ -348,6 +655,43 @@ std::vector<float> TextModel::logits(const std::vector<float> & hidden) {
      return Graph::read(l);
  }
  

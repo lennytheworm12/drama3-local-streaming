@@ -1,16 +1,18 @@
 diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
-index ffbcba36..98715dd9 100644
+index ffbcba36..e6adf244 100644
 --- a/src/ggml-backend.cpp
 +++ b/src/ggml-backend.cpp
-@@ -20,6 +20,7 @@
+@@ -20,7 +20,9 @@
  #include <stdlib.h>
  #include <string.h>
  #include <algorithm>
 +#include <chrono>
  #include <unordered_map>
++#include <unordered_set>
  #include <vector>
  
-@@ -1862,16 +1863,43 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+ #ifdef __APPLE__
+@@ -1862,16 +1864,51 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
      }
  }
  
@@ -45,6 +47,14 @@ index ffbcba36..98715dd9 100644
 +        }
 +        fprintf(stderr, "\n");
 +    }
++
++    // speech.cpp experiment (GGML_SCHED_EARLY=1): where a device split is followed by a CPU split, the device split's
++    // nodes after the last one the CPU split reads (Drama 3's shared expert, built after the router) are held back
++    // and submitted once the CPU split has copied its inputs, so the device computes them while the CPU computes.
++    // The device runs its nodes in the graph's order either way, so the allocator's reuse of memory still holds.
++    static const bool early = getenv("GGML_SCHED_EARLY") != nullptr;
++    struct ggml_cgraph tail = {};
++    int tail_backend = -1;
  
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
@@ -54,10 +64,46 @@ index ffbcba36..98715dd9 100644
  
          // ensure the previous split's async work has completed before we start
          // this split, the allocator may have reused buffer regions across splits
-@@ -1897,10 +1925,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1896,11 +1933,52 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
          }
  
-         if (!sched->callback_eval) {
+-        if (!sched->callback_eval) {
++        if (tail_backend >= 0) {
++            // the CPU split's inputs are copied: the device goes on with the nodes held back
++            enum ggml_status ec = ggml_backend_graph_compute_async(sched->backends[tail_backend], &tail);
++            if (ec != GGML_STATUS_SUCCESS) return ec;
++            tail_backend = -1;
++        }
++
++        int head_nodes = split->graph.n_nodes;
++        if (early && !sched->callback_eval && split_id + 1 < sched->n_splits &&
++            ggml_backend_dev_type(ggml_backend_get_device(sched->backends[splits[split_id + 1].backend_id])) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++            const struct ggml_backend_sched_split * next = &splits[split_id + 1];
++            std::unordered_map<const ggml_tensor *, int> index;
++            for (int j = 0; j < split->graph.n_nodes; j++) index[split->graph.nodes[j]] = j;
++            int last = -1;
++            for (int k = 0; k < next->n_inputs; k++) {
++                for (const ggml_tensor * t = next->inputs[k]; t; t = t->view_src) {
++                    auto it = index.find(t);
++                    if (it != index.end() && it->second > last) last = it->second;
++                }
++            }
++            if (last + 1 < split->graph.n_nodes) {
++                head_nodes = last + 1;
++                tail = ggml_graph_view(&split->graph, head_nodes, split->graph.n_nodes);
++                tail_backend = split_backend_id;
++                static long told = 0;
++                if (told++ < 3) fprintf(stderr, "sched-early: split %d of %d nodes holds back %d\n", split_id, split->graph.n_nodes, split->graph.n_nodes - head_nodes);
++            }
++        }
++
++        if (!sched->callback_eval && head_nodes < split->graph.n_nodes) {
++            struct ggml_cgraph head = ggml_graph_view(&split->graph, 0, head_nodes);
++            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &head);
++            if (ec != GGML_STATUS_SUCCESS) return ec;
++        } else if (!sched->callback_eval) {
 +            const double t_copied = tm.on ? sched_now_ms() : 0;
              enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
              if (ec != GGML_STATUS_SUCCESS) {
@@ -72,7 +118,7 @@ index ffbcba36..98715dd9 100644
          } else {
              // similar to ggml_backend_compare_graph_backend
              for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
-@@ -1943,6 +1978,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1943,6 +2021,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          prev_backend_id = split_backend_id;
      }
  
