@@ -33,9 +33,11 @@ def main():
     ap.add_argument("--streams", type=int, default=4, help="takes generated side by side (4 fastest; 1 if VRAM is tight)")
     ap.add_argument("--voice", default="none", help="'none', or the name given with --voice-file")
     ap.add_argument("--voice-file", help="a voice file (.voice.gguf) made with `speech voice`")
-    # Q4_K is the default: in Bi's blind round 2 it was preferred (69% against 44% "would watch"), and Q2_K's takes
-    # drew the intonation complaints. Pass --model win\Drama-exps-q2k.gguf for faster drafts.
-    ap.add_argument("--model", default=os.path.join(HERE, "win", "Drama-35B-A3B-v3-Q4_K.gguf"))
+    # Q4_K: in Bi's blind round 2 it was preferred (69% against 44% "would watch"), and Q2_K's takes drew the intonation
+    # complaints. The default is our Q4_K quantized from F16 with an English importance matrix (2026-10-20): the same size
+    # and speed as the published one, with less than half its KL from F16 on 6 held-out sentences (0.032 against 0.073).
+    # Pass --model win\Drama-35B-A3B-v3-Q4_K.gguf for the published file, win\Drama-exps-q2k.gguf for faster drafts.
+    ap.add_argument("--model", default=os.path.join(HERE, "win", "Drama-imx-q4k.gguf"))
     ap.add_argument("--binary", default=os.path.join(HERE, "src", "speech.cpp-exp", "build-vk3", "speech.exe"))
     ap.add_argument("--out")
     a = ap.parse_args()
@@ -58,7 +60,9 @@ def main():
     # chunk (2,048 prompt rows, 1,024 frames, 47 s) rather than the model's longest, and the 0.3 GB embedding table
     # in RAM. That is 1.6 GB less per stream, which made room for more streams; flash attention saves 5 ms a frame.
     for k, v in {"SPEECH_KV_F16": "1", "SPEECH_MAX_PROMPT_ROWS": "2048", "SPEECH_MAX_FRAMES": "1024",
-                 "SPEECH_EMBD_ON_CPU": "1", "SPEECH_FLASH_ATTN": "1"}.items():
+                 "SPEECH_EMBD_ON_CPU": "1", "SPEECH_FLASH_ATTN": "1",
+                 # the CPU's side of each layer's handoff in the device's pinned memory: 5% faster, the same takes
+                 "SPEECH_SCHED_PINNED": "1"}.items():
         os.environ.setdefault(k, v)
     # Several takes at once, one's CPU experts beside another's GPU layers: 4 streams of 2 threads gave 1.24-1.27x
     # realtime throughput, 3 streams 1.14-1.20x, 2 streams 1.08x, one stream 0.77x with 8 layers' experts on the GPU.
