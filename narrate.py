@@ -31,6 +31,15 @@ def main():
     ap.add_argument("--takes", type=int, default=3)
     ap.add_argument("--first-seed", type=int, default=1)
     ap.add_argument("--streams", type=int, default=4, help="takes generated side by side (4 fastest; 1 if VRAM is tight)")
+    # The 30% of each layer's routed experts the English calibration used most at a higher type (2026-10-21), from the
+    # sidecars hotx writes: q6 halves the main token's KL from F16 (0.013 against 0.023) for 13% less speed and 2.4 GB
+    # more RAM; q5 gives about the same KL for 7% less speed and 1.2 GB more.
+    ap.add_argument("--hot", choices=("none", "q5", "q6"), default="none", help="hot experts at a higher type: closer to the full model, slower")
+    # SSD streaming (2026-10-21) for a machine with less RAM: the CPU layers' experts read from the SSD into a cache of
+    # the RAM given less the 1.8 GB the process takes without them; least recently used, all of a layer's misses read
+    # at once, bypassing Windows' file cache. One take at a time: 0.40x at 12 GB, 0.34x at 10, 0.27x at 8 (0.76x in
+    # RAM), the same takes as in RAM. Pinning the calibration's hottest experts and reading ahead both measured slower.
+    ap.add_argument("--ram-gb", type=float, help="stream the experts from the SSD to fit in this much RAM (one take at a time)")
     ap.add_argument("--voice", default="none", help="'none', or the name given with --voice-file")
     ap.add_argument("--voice-file", help="a voice file (.voice.gguf) made with `speech voice`")
     # Q4_K: in Bi's blind round 2 it was preferred (69% against 44% "would watch"), and Q2_K's takes drew the intonation
@@ -71,8 +80,15 @@ def main():
     # Each stream's caches take device memory, so with several every layer's experts stay with the CPU; a single
     # stream holds 5 layers' (about 6.7 GB with the mixed file; more overcommits the card once other programs take some).
     # Four streams of the mixed file peak at 7.4 GB of the card's 8; with other programs holding VRAM, use --streams 3.
-    streams = a.streams
+    streams = 1 if a.ram_gb else a.streams
+    if a.ram_gb:
+        if a.ram_gb < 4:
+            sys.exit("--ram-gb needs at least 4: the process takes 1.8 GB besides its expert cache")
+        os.environ.setdefault("SPEECH_STREAM_MB", str(int((a.ram_gb - 1.8) * 1024 * 0.98)))
+        os.environ.setdefault("SPEECH_STREAM_IO", "overlapped")
     os.environ.setdefault("SPEECH_STREAMS", str(streams))
+    if a.hot != "none":
+        os.environ.setdefault("SPEECH_HOT_FILE", os.path.join(HERE, "win", f"Drama-hot30-{a.hot}_K.gguf"))
     os.environ.setdefault("SPEECH_GPU_EXPERT_LAYERS_EXACT", "0" if streams > 1 else "5")
     args, voice = [], a.voice
     if streams > 1:

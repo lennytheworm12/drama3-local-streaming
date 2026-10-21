@@ -6,8 +6,8 @@ Windows build is made from file for file.
 
 | Patch | Applies in | What |
 |---|---|---|
-| `speech.cpp-exp.diff` | the speech.cpp root | Every experiment: loaders, expert prefetch, mixed expert quants, the fused audio decoder, concurrent streams, the VRAM savings, flash attention, GPU-layer caps, pinned handoff memory, importance-matrix collection and quantising, and the measurement switches. 18 files (including the new `src/common/imatrix.{cpp,h}`), about 1,400 lines added. |
-| `ggml-experiments.diff` | the `ggml` submodule (at `a655cf6`) | Scheduler timing, split dumps and the rejected early-submit experiment (`ggml-backend.cpp`), and the CPU `mul_mat_id` skipping an expert id of -1, which only hot-expert tiering needs (`ggml-cpu.c`). |
+| `speech.cpp-exp.diff` | the speech.cpp root | Every experiment: loaders, expert prefetch, mixed expert quants, the fused audio decoder, concurrent streams, the VRAM savings, flash attention, GPU-layer caps, pinned handoff memory, importance-matrix collection and quantising, hot-expert sidecars, SSD expert streaming, and the measurement switches. 21 files (including the new `src/common/imatrix.{cpp,h}`, `src/families/drama3/expert-stream.{cpp,h}` and `tools/hotx`), about 2,300 lines added. |
+| `ggml-experiments.diff` | the `ggml` submodule (at `a655cf6`) | Scheduler timing, split dumps and the rejected early-submit experiment (`ggml-backend.cpp`), and the CPU `mul_mat_id` skipping an expert id of -1 (`ggml-cpu.c`), which the hot-expert sidecar (`SPEECH_HOT_FILE`) and GPU tiering need. |
 
 ```
 git clone https://github.com/nyosegawa/speech.cpp && cd speech.cpp
@@ -50,6 +50,8 @@ and 6 leaves headroom. `SPEECH_MIXED_OK=1` is needed to read the mixed-expert fi
 | `SPEECH_FLASH_ATTN=1` | `ggml_flash_attn_ext` with the F16 cache, F32 accumulation (−5.5 ms a frame) | `attention.cpp` |
 | `SPEECH_SCHED_PINNED=1` | the scheduler's CPU buffers in Vulkan pinned host memory, so GPU↔CPU handoff copies are faster (bit-identical, −3 ms a frame) | `text-model.cpp` |
 | `SPEECH_IMATRIX_OUT=path`, `SPEECH_QUANT_IMATRIX=path` | importance matrix: an eval callback on every MUL_MAT / MUL_MAT_ID of the text model, audio decoder and head accumulates each input channel's sum of squares (per expert for stacked experts) and saves it at exit; `speech quantize` then weights each matrix's rounding error by it | `src/common/imatrix.{cpp,h}`, `src/common/graph.cpp`, `text-model.cpp`, `quantize.cpp`, `CMakeLists.txt` |
+| `SPEECH_HOT_FILE=path` (opt-in) | a sidecar from `tools/hotx` with each layer's most-routed 30% of experts at Q5_K/Q6_K and the rest at Q4_K, used in place of the main file's CPU experts; picks go to the hot or cold tensor with -1 in the other. `narrate.cmd --hot q6\|q5`. | `drama3-engine.cpp`, `text-model.{cpp,h}`, `tools/hotx/hotx.cpp` |
+| `SPEECH_STREAM_MB=n`, `SPEECH_STREAM_IO=overlapped` | SSD streaming: the CPU layers' experts are not loaded; a cache of n MB of whole experts takes their place, filled by unbuffered reads (all of a layer's misses at once with `overlapped`). Bit-identical takes. `narrate.cmd --ram-gb N`. | `src/families/drama3/expert-stream.{cpp,h}`, `text-model.cpp`, `drama3-engine.cpp` |
 | `SPEECH_GPU_EXPERT_LAYERS=n`, `SPEECH_GPU_EXPERT_LAYERS_EXACT=n` | cap, or set exactly, how many layers' experts go on the GPU. The cap fixes VRAM overcommit when other apps hold VRAM; the exact count is needed because the automatic estimate doesn't see the smaller caches. | `drama3-engine.cpp` |
 
 **Tried and rejected** (kept so the results can be reproduced)
@@ -63,6 +65,9 @@ and 6 leaves headroom. `SPEECH_MIXED_OK=1` is needed to read the mixed-expert fi
 | `SPEECH_SKIP_CPU_EXPERTS=1` | draft model for speculative decoding: CPU-held layers keep only the shared expert | `text-model.cpp` |
 | `SPEECH_HOT_EXPERTS=list SPEECH_HOT_GB=n` | hot-expert GPU tiering (unstable: some sizes give non-finite logits; needs the ggml `mul_mat_id` change) | `text-model.cpp`, `drama3-engine.cpp` |
 | `SPEECH_POLL=0..100` | threadpool polling | `drama3-engine.cpp` |
+| `SPEECH_STREAM_PIN=f`, `SPEECH_STREAM_IMATRIX=path` | pin a fraction of the stream cache to the calibration's most-routed experts (lost to plain LRU) | `expert-stream.cpp` |
+| `SPEECH_STREAM_PREFETCH=1` | read ahead the next layer's guessed picks (always slower) | `expert-stream.cpp`, `text-model.cpp` |
+| `SPEECH_STREAM_FILE=path` | a contiguous expert file from `stream_layout.py`, one read per expert (about neutral) | `expert-stream.cpp` |
 | `GGML_SCHED_EARLY=1` | shared expert computed on the GPU beside the CPU experts: the device split's tail is submitted once the CPU split has copied its inputs | `text-model.cpp`, ggml `src/ggml-backend.cpp` |
 
 **Measurement**
@@ -88,5 +93,11 @@ SPEECH_MIXED_OK=1 speech tts Drama-exps-q2k.gguf --voice none -o hello.wav "Hell
 ```
 
 `Drama-imx-q4k.gguf` has the published file's types and size (20.8 GB). `Drama-imx2-mix.gguf`, the default, uses the round 2 matrix (which also covers the audio decoder and head) and keeps everything but the routed experts at Q6_K, with the embedding and head at Q8_0: 21.8 GB. The matrices are about 190 MB each and not in this repo ([`imx_quant.sh`](../scorecard/tools/imx_quant.sh) and [`imx2_quant.sh`](../scorecard/tools/imx2_quant.sh) are the scripts we ran). The Q2_K file has base type Q4_K, routed experts Q2_K and the router F32 (the layout requires it): 13.2 GB against 20.8 GB.
+
+A hot-expert sidecar (the default arguments of [`hotx_run.sh`](../scorecard/tools/hotx_run.sh)):
+
+```
+hotx Drama-35B-A3B-v3-F16.gguf imatrix-en2.simx Drama-hot30-q6_K.gguf 0.3 q6_K
+```
 
 The native Windows build needs no source changes beyond these patches; see [`docs/build-windows.md`](../docs/build-windows.md).

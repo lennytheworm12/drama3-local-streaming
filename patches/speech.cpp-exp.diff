@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b8116ee..68f80a0 100644
+index b8116ee..b0a4de0 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -39,6 +39,7 @@ add_library(speechcommon STATIC
@@ -10,6 +10,25 @@ index b8116ee..68f80a0 100644
      src/common/backend.cpp
      src/common/wav.cpp
      src/common/args.cpp
+@@ -150,6 +151,7 @@ add_library(drama3 STATIC
+     src/families/drama3/synthesizer.cpp
+     src/families/drama3/voice-file.cpp
+     src/families/drama3/placement.cpp
++    src/families/drama3/expert-stream.cpp
+ )
+ target_include_directories(drama3 PUBLIC src/families)
+ target_link_libraries(drama3 PUBLIC speechcommon)
+@@ -289,6 +291,10 @@ endif()
+ 
+ # The checks compare each stage with the reference dumps; they are built but not released. compare.h, npy.h and
+ # reference-dumps.h at the top of checks/ are shared by the checks of several folders.
++# Experiment: the hot-expert sidecar writer (tools/hotx).
++add_executable(hotx tools/hotx/hotx.cpp)
++target_link_libraries(hotx PRIVATE speechcommon)
++
+ add_executable(resample-check checks/common/resample-check.cpp)
+ target_include_directories(resample-check PRIVATE checks)
+ target_link_libraries(resample-check PRIVATE speechcommon)
 diff --git a/src/api/request.cpp b/src/api/request.cpp
 index 5e5476c..02436f4 100644
 --- a/src/api/request.cpp
@@ -558,7 +577,7 @@ index d2b1102..0be81f4 100644
                           (most == bytes.end() ? std::string("the file holds no tensor") : "most of its tensors' bytes are " + tensor_type_text(most->first)) +
                           "; " + file.remedy());
 diff --git a/src/common/model-file.h b/src/common/model-file.h
-index 31cbf4f..9fa7a6c 100644
+index 31cbf4f..7c87757 100644
 --- a/src/common/model-file.h
 +++ b/src/common/model-file.h
 @@ -7,6 +7,7 @@
@@ -569,7 +588,16 @@ index 31cbf4f..9fa7a6c 100644
  #include <string>
  #include <unordered_map>
  #include <vector>
-@@ -172,6 +173,20 @@ private:
+@@ -84,6 +85,8 @@ public:
+ 
+     /** A loaded tensor; one the file does not hold or that was not loaded throws. */
+     ggml_tensor * tensor(const std::string & name) const;
++    /** Whether the tensor `name` was loaded (the placement may leave some out). */
++    bool loaded(const std::string & name) const { return by_name_.count(name) > 0; }
+ 
+     /** Whether the file has `key`, for a key that a file has only where its model has a value for it. */
+     bool has(const std::string & key) const;
+@@ -172,6 +175,20 @@ private:
      std::shared_ptr<gguf_context> gguf_;
      /** The shapes and types of every tensor of the file, which ggml reads with its metadata. */
      std::shared_ptr<ggml_context> ctx_;
@@ -736,7 +764,7 @@ index 2c98723..cb0b4da 100644
          write_bytes(target.get(), data, out);
      }
 diff --git a/src/engines/drama3-engine.cpp b/src/engines/drama3-engine.cpp
-index d9885d2..a67018a 100644
+index d9885d2..6703071 100644
 --- a/src/engines/drama3-engine.cpp
 +++ b/src/engines/drama3-engine.cpp
 @@ -1,6 +1,10 @@
@@ -750,7 +778,16 @@ index d9885d2..a67018a 100644
  #include <map>
  #include <memory>
  #include <string>
-@@ -55,7 +59,16 @@ Placement place_experts(const std::string & path, ggml_backend_t backend) {
+@@ -9,6 +13,8 @@
+ #include "drama3/layout.h"
+ #include "drama3/placement.h"
+ #include "drama3/synthesizer.h"
++#include "drama3/text-model.h"
++#include "drama3/expert-stream.h"
+ #include "drama3/voice-file.h"
+ #include "engine.h"
+ #include "error.h"
+@@ -55,7 +61,16 @@ Placement place_experts(const std::string & path, ggml_backend_t backend) {
      if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) return {layers, layers};
      size_t free = 0, total = 0;
      ggml_backend_dev_memory(device, &free, &total);
@@ -768,7 +805,7 @@ index d9885d2..a67018a 100644
      if (held < layers) {
          log_message(LogLevel::Warn, "Drama 3 computes the experts of " + std::to_string(layers - held) + " of its " + std::to_string(layers) +
                                          " layers on the CPU, since " + ggml_backend_name(backend) + " holds those of " + std::to_string(held) +
-@@ -64,6 +77,11 @@ Placement place_experts(const std::string & path, ggml_backend_t backend) {
+@@ -64,6 +79,11 @@ Placement place_experts(const std::string & path, ggml_backend_t backend) {
      return {layers, held};
  }
  
@@ -780,11 +817,17 @@ index d9885d2..a67018a 100644
  class Drama3Engine : public Engine {
  public:
      Drama3Engine(const std::string & path, ggml_backend_t backend, int threads)
-@@ -72,7 +90,14 @@ public:
+@@ -72,7 +92,20 @@ public:
            pool_(nullptr, ggml_threadpool_free),
            model_(path, drama3::model_layout,
                   [&](const std::string & name) {
 -                     return cpu_ && drama3::is_routed_experts(name) && drama3::layer_of(name) >= placement_.held ? cpu_.get() : backend;
++                     // Experiment (SPEECH_HOT_FILE): a CPU layer the hot-expert sidecar holds leaves the file's experts unloaded.
++                     if (cpu_ && drama3::is_routed_experts(name) && drama3::layer_of(name) >= placement_.held &&
++                         drama3::hot_file_covers(drama3::layer_of(name))) return (ggml_backend_t) nullptr;
++                     // Experiment (SPEECH_STREAM_MB): the CPU layers' routed experts stay on the SSD, read into a cache.
++                     if (cpu_ && drama3::is_routed_experts(name) && drama3::layer_of(name) >= placement_.held &&
++                         drama3::ExpertStream::enabled()) return (ggml_backend_t) nullptr;
 +                     if (cpu_ && drama3::is_routed_experts(name) && drama3::layer_of(name) >= placement_.held) return cpu_.get();
 +                     // Experiment (SPEECH_EMBD_ON_CPU=1): the main tokens' embedding table, 0.3 GB of which a frame reads
 +                     // one row, in host memory; the text model decodes the rows there.
@@ -796,7 +839,7 @@ index d9885d2..a67018a 100644
                   }),
            synth_(model_, backend, cpu_.get()) {
          if (cpu_) {
-@@ -80,13 +105,39 @@ public:
+@@ -80,13 +113,39 @@ public:
              // threads started for each graph made a row take 95 ms where the pool takes 58, on an RTX 2080 with an
              // i9-9900K and 8 threads (2026-10-15).
              ggml_threadpool_params params = ggml_threadpool_params_default(threads);
@@ -836,7 +879,7 @@ index d9885d2..a67018a 100644
      bool computes_on_cpu() const override { return cpu_ != nullptr; }
  
      speech_stop speak(const std::string & text, const RequestValues & values, Run & run) override {
-@@ -108,15 +159,34 @@ public:
+@@ -108,15 +167,34 @@ public:
          }
          r.sampling.top_k = (int) values.integer(SPEECH_OPT_TOP_K);
          r.sampling.top_p = (float) values.number(SPEECH_OPT_TOP_P);
@@ -873,7 +916,7 @@ index d9885d2..a67018a 100644
                                                          [&](const float * samples, size_t n) { return run.audio(samples, n); });
          // A synthesis the sink stopped is cancelled, which the request reports whatever this returns.
          return ending == drama3::Ending::MaxFrames ? SPEECH_STOP_MAX_SECONDS : SPEECH_STOP_COMPLETE;
-@@ -142,6 +212,7 @@ public:
+@@ -142,6 +220,7 @@ public:
          warmup.sampling = drama3::file_sampling(model_);
          warmup.max_frames = kWarmUpFrames;
          synth_.synthesize(warmup, voices_.at(kNoReference), [](const float *, size_t) { return true; });
@@ -881,7 +924,7 @@ index d9885d2..a67018a 100644
      }
  
  private:
-@@ -153,6 +224,17 @@ private:
+@@ -153,6 +232,17 @@ private:
      ModelFile model_;
      drama3::Synthesizer synth_;
      std::map<std::string, drama3::Voice> voices_;
@@ -1290,6 +1333,584 @@ index 417fe68..a67c097 100644
  };
  
  }  // namespace drama3
+diff --git a/src/families/drama3/expert-stream.cpp b/src/families/drama3/expert-stream.cpp
+new file mode 100644
+index 0000000..8ec2397
+--- /dev/null
++++ b/src/families/drama3/expert-stream.cpp
+@@ -0,0 +1,514 @@
++#include "expert-stream.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <numeric>
++#include <stdexcept>
++#include <vector>
++
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++#include "error.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++#include "gguf.h"
++#include "imatrix.h"
++
++namespace drama3 {
++
++namespace {
++
++constexpr size_t kAlign = 4096;
++
++size_t align_down(size_t v) { return v / kAlign * kAlign; }
++size_t align_up(size_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
++
++double now_ms() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++/** An aligned buffer for unbuffered reads. */
++struct Aligned {
++    uint8_t * p = nullptr;
++    size_t n = 0;
++    explicit Aligned(size_t bytes) : n(align_up(bytes)) {
++#ifdef _WIN32
++        p = (uint8_t *) VirtualAlloc(nullptr, n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
++#else
++        if (posix_memalign((void **) &p, kAlign, n) != 0) p = nullptr;
++#endif
++        if (!p) throw Error(Fault::OutOfMemory, "cannot allocate a read buffer");
++    }
++    ~Aligned() {
++#ifdef _WIN32
++        VirtualFree(p, 0, MEM_RELEASE);
++#else
++        std::free(p);
++#endif
++    }
++    Aligned(const Aligned &) = delete;
++    Aligned & operator=(const Aligned &) = delete;
++};
++
++/** One read of `len` bytes at file offset `off`, split in order into up to three destinations (an expert's gate, up and
++ * down slots), through an aligned bounce buffer. */
++struct Read {
++    uint64_t off = 0;
++    size_t len = 0;
++    int parts = 0;
++    uint8_t * dst[3] = {nullptr, nullptr, nullptr};
++    size_t part[3] = {0, 0, 0};
++    void scatter(const uint8_t * src) const {
++        for (int k = 0; k < parts; k++) {
++            std::memcpy(dst[k], src, part[k]);
++            src += part[k];
++        }
++    }
++};
++
++}  // namespace
++
++struct ExpertStream::Impl {
++    // the file the experts come from, read without the OS's cache
++#ifdef _WIN32
++    HANDLE file = INVALID_HANDLE_VALUE;
++#else
++    int fd = -1;
++#endif
++    bool overlapped = false, contiguous = false, prefetch = false;
++    int layers = 0, experts = 0;
++    int64_t slots = 0;
++    size_t bytes[3] = {0, 0, 0};             // one expert's gate, up, down
++    std::vector<std::array<uint64_t, 3>> at;  // per layer: file offset of expert 0 of gate, up, down
++    std::vector<uint64_t> whole_at;           // contiguous layout: per layer, offset of expert 0; stride `whole`
++    size_t whole = 0;
++    // the cache
++    std::vector<int32_t> slot_of;            // [layer * experts + expert] -> slot or -1
++    std::vector<int32_t> owner;              // [slot] -> layer * experts + expert or -1
++    std::vector<uint64_t> used;              // [slot] -> tick of last use
++    std::vector<uint8_t> pinned, inflight, fetched;   // [slot]; fetched: read ahead, not yet used
++    uint64_t tick = 0;
++    std::mutex mutex;
++    // pending prefetch reads
++#ifdef _WIN32
++    struct Pending {
++        OVERLAPPED ov{};
++        std::unique_ptr<Aligned> buf;
++        Read r;
++        size_t lead = 0;
++        int32_t slot = -1;
++    };
++    std::vector<std::unique_ptr<Pending>> pending;
++#endif
++    // statistics
++    long long picks = 0, hits = 0, misses = 0, prefetched = 0, prefetch_used = 0, reads = 0;
++    double read_ms = 0, bytes_read = 0;
++    ggml_tensor *gate = nullptr, *up = nullptr, *down = nullptr;
++
++    ~Impl() {
++        std::fprintf(stderr,
++                     "expert-stream: %lld picks, hit rate %.1f%% (%lld misses), %lld reads of %.2f GB in %.1f s (%.0f MB/s while reading)",
++                     picks, picks ? 100.0 * hits / picks : 0.0, misses, reads, bytes_read / 1e9, read_ms / 1e3,
++                     read_ms > 0 ? bytes_read / 1e3 / read_ms : 0.0);
++        if (prefetch) std::fprintf(stderr, ", %lld prefetched, %lld of them used (cache hit rate without them %.1f%%)", prefetched, prefetch_used,
++                                   picks ? 100.0 * (hits - prefetch_used) / picks : 0.0);
++        std::fprintf(stderr, "\n");
++    }
++
++    /** Reads `rs`, all at once where overlapped, else one at a time; blocks until all are in. */
++    void read_all(const std::vector<Read> & rs) {
++        if (rs.empty()) return;
++        const double t0 = now_ms();
++#ifdef _WIN32
++        struct Op {
++            OVERLAPPED ov{};
++            std::unique_ptr<Aligned> buf;
++            size_t lead = 0, span = 0;
++        };
++        std::vector<Op> ops(rs.size());
++        const auto start = [&](size_t i) {
++            const Read & r = rs[i];
++            Op & o = ops[i];
++            const uint64_t a = align_down(r.off);
++            o.lead = (size_t) (r.off - a);
++            o.span = align_up(o.lead + r.len);
++            o.buf = std::make_unique<Aligned>(o.span);
++            o.ov.Offset = (DWORD) (a & 0xffffffffu);
++            o.ov.OffsetHigh = (DWORD) (a >> 32);
++            o.ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++            if (!ReadFile(file, o.buf->p, (DWORD) o.span, nullptr, &o.ov) && GetLastError() != ERROR_IO_PENDING) {
++                throw Error(Fault::Io, "expert-stream: a read failed to start (" + std::to_string(GetLastError()) + ")");
++            }
++        };
++        const auto finish = [&](size_t i) {
++            Op & o = ops[i];
++            DWORD got = 0;
++            if (!GetOverlappedResult(file, &o.ov, &got, TRUE)) throw Error(Fault::Io, "expert-stream: a read failed");
++            if (got < o.lead + rs[i].len) throw Error(Fault::Io, "expert-stream: a short read");
++            rs[i].scatter(o.buf->p + o.lead);
++            CloseHandle(o.ov.hEvent);
++        };
++        if (overlapped) {
++            for (size_t i = 0; i < rs.size(); i++) start(i);
++            for (size_t i = 0; i < rs.size(); i++) finish(i);
++        } else {
++            for (size_t i = 0; i < rs.size(); i++) {
++                start(i);
++                finish(i);
++            }
++        }
++#else
++        std::vector<uint8_t> tmp;
++        for (const Read & r : rs) {
++            tmp.resize(r.len);
++            if (pread(fd, tmp.data(), r.len, (off_t) r.off) != (ssize_t) r.len) throw Error(Fault::Io, "expert-stream: a short read");
++            r.scatter(tmp.data());
++        }
++#endif
++        read_ms += now_ms() - t0;
++        reads += (long long) rs.size();
++        for (const Read & r : rs) bytes_read += (double) r.len;
++    }
++
++    /** The reads that bring expert `e` of layer `l` into slot `s`: one whole read from the contiguous file, else three. */
++    void reads_for(int l, int e, int32_t s, std::vector<Read> & rs) {
++        uint8_t * d[3] = {(uint8_t *) gate->data + (size_t) s * gate->nb[2], (uint8_t *) up->data + (size_t) s * up->nb[2],
++                          (uint8_t *) down->data + (size_t) s * down->nb[2]};
++        if (contiguous) {
++            Read r;
++            r.off = whole_at[(size_t) l] + (uint64_t) e * whole;
++            r.parts = 3;
++            for (int k = 0; k < 3; k++) {
++                r.dst[k] = d[k];
++                r.part[k] = bytes[k];
++                r.len += bytes[k];
++            }
++            rs.push_back(r);
++            return;
++        }
++        for (int k = 0; k < 3; k++) {
++            Read r;
++            r.off = at[(size_t) l][(size_t) k] + (uint64_t) e * bytes[k];
++            r.len = bytes[k];
++            r.parts = 1;
++            r.dst[0] = d[k];
++            r.part[0] = bytes[k];
++            rs.push_back(r);
++        }
++    }
++
++    /** A free or least recently used unpinned slot, not used since tick `since` and not in flight. */
++    int32_t victim(uint64_t since) {
++        int32_t best = -1;
++        for (int32_t s = 0; s < (int32_t) slots; s++) {
++            // a read-ahead not yet used stays for the layer it was read for
++            if (pinned[(size_t) s] || inflight[(size_t) s] || fetched[(size_t) s]) continue;
++            if (owner[(size_t) s] < 0) return s;
++            if (used[(size_t) s] >= since) continue;
++            if (best < 0 || used[(size_t) s] < used[(size_t) best]) best = s;
++        }
++        if (best < 0) throw Error(Fault::OutOfMemory, "expert-stream: the cache holds fewer experts than a layer's picks; raise SPEECH_STREAM_MB");
++        return best;
++    }
++
++    void assign(int32_t s, int key) {
++        if (owner[(size_t) s] >= 0) slot_of[(size_t) owner[(size_t) s]] = -1;
++        fetched[(size_t) s] = 0;
++        owner[(size_t) s] = key;
++        slot_of[(size_t) key] = s;
++    }
++
++    /**
++     * Lands the prefetches in flight: those into slot `need` (or every one, with -1) waited for, the others only where
++     * already complete, so that a wrong guess still reading costs nothing until its slot is wanted again.
++     */
++    void drain(int32_t need = -2) {
++#ifdef _WIN32
++        for (size_t i = 0; i < pending.size();) {
++            Pending & p = *pending[i];
++            const bool wait = need == -1 || p.slot == need;
++            if (!wait && !HasOverlappedIoCompleted(&p.ov)) {
++                i++;
++                continue;
++            }
++            DWORD got = 0;
++            if (!GetOverlappedResult(file, &p.ov, &got, TRUE)) throw Error(Fault::Io, "expert-stream: a prefetch failed");
++            p.r.scatter(p.buf->p + p.lead);
++            CloseHandle(p.ov.hEvent);
++            const int32_t s = p.slot;
++            pending.erase(pending.begin() + (std::ptrdiff_t) i);
++            bool more = false;
++            for (const auto & q : pending) more = more || q->slot == s;
++            if (!more) inflight[(size_t) s] = 0;
++        }
++#else
++        (void) need;
++#endif
++    }
++
++    void resolve(int l, const int32_t * ids, int64_t n, int32_t * out) {
++        std::lock_guard<std::mutex> lock(mutex);
++        drain();  // only what has landed
++        const uint64_t start = ++tick;
++        std::vector<Read> rs;
++        for (int64_t i = 0; i < n; i++) {
++            const int e = ids[i];
++            const int key = l * experts + e;
++            picks++;
++            int32_t s = slot_of[(size_t) key];
++            if (s >= 0) {
++                hits++;
++                if (inflight[(size_t) s]) {
++                    const double t_wait = now_ms();
++                    drain(s);
++                    read_ms += now_ms() - t_wait;
++                }
++                if (fetched[(size_t) s]) {
++                    fetched[(size_t) s] = 0;
++                    prefetch_used++;
++                }
++            } else {
++                misses++;
++                s = victim(start);
++                assign(s, key);
++                reads_for(l, e, s, rs);
++            }
++            used[(size_t) s] = start;
++            out[i] = s;
++        }
++        read_all(rs);
++        // this layer's read-aheads it did not pick were wrong guesses; their slots are free to take again
++        for (int64_t s = 0; s < slots; s++) {
++            if (fetched[(size_t) s] && owner[(size_t) s] >= 0 && owner[(size_t) s] / experts == l) fetched[(size_t) s] = 0;
++        }
++    }
++
++    void prefetch_layer(int l, const int32_t * ids, int64_t n) {
++#ifdef _WIN32
++        std::lock_guard<std::mutex> lock(mutex);
++        const uint64_t keep_since = tick;  // the slots this layer just resolved stay
++        for (int64_t i = 0; i < n; i++) {
++            const int key = l * experts + ids[i];
++            if (slot_of[(size_t) key] >= 0) continue;
++            while (pending.size() >= 512) drain(pending.front()->slot);  // a bound on reads in flight
++            const int32_t s = victim(keep_since);
++            assign(s, key);
++            used[(size_t) s] = tick;
++            inflight[(size_t) s] = 1;
++            fetched[(size_t) s] = 1;
++            std::vector<Read> rs;
++            reads_for(l, ids[i], s, rs);
++            for (const Read & r : rs) {
++                auto p = std::make_unique<Pending>();
++                const uint64_t a = align_down(r.off);
++                p->lead = (size_t) (r.off - a);
++                const size_t span = align_up(p->lead + r.len);
++                p->buf = std::make_unique<Aligned>(span);
++                p->r = r;
++                p->slot = s;
++                p->ov.Offset = (DWORD) (a & 0xffffffffu);
++                p->ov.OffsetHigh = (DWORD) (a >> 32);
++                p->ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++                if (!ReadFile(file, p->buf->p, (DWORD) span, nullptr, &p->ov) && GetLastError() != ERROR_IO_PENDING) {
++                    throw Error(Fault::Io, "expert-stream: a prefetch failed to start");
++                }
++                reads++;
++                bytes_read += (double) r.len;
++                pending.push_back(std::move(p));
++            }
++            prefetched++;
++        }
++#else
++        (void) l; (void) ids; (void) n;
++#endif
++    }
++};
++
++namespace {
++
++struct OpData {
++    ExpertStream::Impl * impl;
++    int layer;
++};
++
++void resolve_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int, void * userdata) {
++    if (ith != 0) return;
++    const auto * d = (const OpData *) userdata;
++    d->impl->resolve(d->layer, (const int32_t *) a->data, ggml_nelements(a), (int32_t *) dst->data);
++}
++
++void prefetch_op(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor *, int ith, int, void * userdata) {
++    if (ith != 0) return;
++    const auto * d = (const OpData *) userdata;
++    std::memcpy(dst->data, a->data, ggml_nbytes(a));
++    // the guess, deduplicated: top-k rows repeat experts across rows
++    std::vector<int32_t> ids((const int32_t *) a->data, (const int32_t *) a->data + ggml_nelements(a));
++    std::sort(ids.begin(), ids.end());
++    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
++    d->impl->prefetch_layer(d->layer, ids.data(), (int64_t) ids.size());
++}
++
++std::vector<std::unique_ptr<OpData>> & op_data() {
++    static std::vector<std::unique_ptr<OpData>> v;
++    return v;
++}
++
++OpData * data_for(ExpertStream::Impl * impl, int layer) {
++    auto & v = op_data();
++    if (v.empty()) {
++        for (int l = 0; l < impl->layers; l++) v.push_back(std::make_unique<OpData>(OpData{impl, l}));
++    }
++    return v[(size_t) layer].get();
++}
++
++}  // namespace
++
++bool ExpertStream::enabled() {
++    const char * v = std::getenv("SPEECH_STREAM_MB");
++    return v && *v && std::atof(v) > 0;
++}
++
++ExpertStream * ExpertStream::get(const ModelFile & m) {
++    static ExpertStream * stream = [&]() -> ExpertStream * {
++        if (!enabled()) return nullptr;
++        auto * s = new ExpertStream;
++        static std::unique_ptr<Impl> owned(new Impl);  // destroyed at exit, which prints the statistics
++        auto * impl = owned.get();
++        s->impl_ = impl;
++        const double budget = std::atof(std::getenv("SPEECH_STREAM_MB")) * 1048576.0;
++        const char * io = std::getenv("SPEECH_STREAM_IO");
++        impl->overlapped = io && std::strcmp(io, "overlapped") == 0;
++        const char * pf = std::getenv("SPEECH_STREAM_PREFETCH");
++        impl->prefetch = pf && *pf == '1';
++        const char * whole_file = std::getenv("SPEECH_STREAM_FILE");
++        impl->contiguous = whole_file && *whole_file;
++
++        ggml_context * meta = nullptr;
++        gguf_init_params ip = {true, &meta};
++        gguf_context * g = gguf_init_from_file(m.path().c_str(), ip);
++        if (!g) throw Error(Fault::Io, "expert-stream: cannot read " + m.path());
++        impl->layers = (int) m.count("drama3.text.num_hidden_layers");
++        const char * names[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
++        const ggml_tensor * first[3];
++        for (int k = 0; k < 3; k++) first[k] = ggml_get_tensor(meta, ("blk.0." + std::string(names[k])).c_str());
++        impl->experts = (int) first[0]->ne[2];
++        for (int k = 0; k < 3; k++) impl->bytes[k] = first[k]->nb[2];
++        for (int l = 0; l < impl->layers; l++) {
++            std::array<uint64_t, 3> a{};
++            for (int k = 0; k < 3; k++) {
++                const std::string name = "blk." + std::to_string(l) + "." + names[k];
++                const int64_t id = gguf_find_tensor(g, name.c_str());
++                const ggml_tensor * t = ggml_get_tensor(meta, name.c_str());
++                if (t->type != first[k]->type || t->nb[2] != first[k]->nb[2]) throw Error(Fault::File, "expert-stream: layers differ in type");
++                a[(size_t) k] = gguf_get_data_offset(g) + gguf_get_tensor_offset(g, id);
++            }
++            impl->at.push_back(a);
++        }
++        const size_t per = impl->bytes[0] + impl->bytes[1] + impl->bytes[2];
++        impl->slots = (int64_t) (budget / (double) per);
++        if (impl->slots < impl->experts + 32) throw Error(Fault::OutOfMemory, "expert-stream: SPEECH_STREAM_MB holds fewer than a layer's experts");
++
++        ggml_context * ctx = ggml_init({ggml_tensor_overhead() * 3, nullptr, true});
++        impl->gate = s->gate_ = ggml_new_tensor_3d(ctx, first[0]->type, first[0]->ne[0], first[0]->ne[1], impl->slots);
++        impl->up = s->up_ = ggml_new_tensor_3d(ctx, first[1]->type, first[1]->ne[0], first[1]->ne[1], impl->slots);
++        impl->down = s->down_ = ggml_new_tensor_3d(ctx, first[2]->type, first[2]->ne[0], first[2]->ne[1], impl->slots);
++        ggml_set_name(s->gate_, "stream.gate");
++        ggml_set_name(s->up_, "stream.up");
++        ggml_set_name(s->down_, "stream.down");
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_cpu_buffer_type());
++        if (!buf) throw Error(Fault::OutOfMemory, "expert-stream: cannot allocate the cache");
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++        const size_t n_keys = (size_t) impl->layers * (size_t) impl->experts;
++        impl->slot_of.assign(n_keys, -1);
++        impl->owner.assign((size_t) impl->slots, -1);
++        impl->used.assign((size_t) impl->slots, 0);
++        impl->pinned.assign((size_t) impl->slots, 0);
++        impl->inflight.assign((size_t) impl->slots, 0);
++        impl->fetched.assign((size_t) impl->slots, 0);
++
++        const std::string path = impl->contiguous ? std::string(whole_file) : m.path();
++        if (impl->contiguous) {
++            impl->whole = align_up(per);
++            for (int l = 0; l < impl->layers; l++) impl->whole_at.push_back((uint64_t) l * (uint64_t) impl->experts * impl->whole);
++        }
++#ifdef _WIN32
++        const int wn = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
++        std::wstring wpath((size_t) wn, L'\0');
++        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wn);
++        impl->file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
++                                 FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
++        if (impl->file == INVALID_HANDLE_VALUE) throw Error(Fault::Io, "expert-stream: cannot open " + path);
++#else
++        impl->fd = open(path.c_str(), O_RDONLY);
++        if (impl->fd < 0) throw Error(Fault::Io, "expert-stream: cannot open " + path);
++#endif
++        // Pinned: the most-routed experts first, by the calibration's counts, read now and never evicted.
++        const char * pin = std::getenv("SPEECH_STREAM_PIN");
++        const double pin_fraction = pin ? std::atof(pin) : 0.0;
++        if (pin_fraction > 0) {
++            const char * imx = std::getenv("SPEECH_STREAM_IMATRIX");
++            if (!imx || !*imx) throw Error(Fault::InvalidArgument, "SPEECH_STREAM_PIN needs SPEECH_STREAM_IMATRIX for the experts' counts");
++            Imatrix im;
++            im.load(imx);
++            std::vector<std::pair<int64_t, int>> rank;  // (count, key)
++            for (int l = 0; l < impl->layers; l++) {
++                const auto it = im.entries.find("blk." + std::to_string(l) + ".ffn_gate_exps");
++                for (int e = 0; e < impl->experts; e++) {
++                    const int64_t c = it == im.entries.end() ? 0 : it->second.rows[(size_t) e];
++                    rank.emplace_back(c, l * impl->experts + e);
++                }
++            }
++            std::stable_sort(rank.begin(), rank.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
++            const int64_t n_pin = std::min<int64_t>((int64_t) (pin_fraction * (double) impl->slots), impl->slots - impl->experts - 32);
++            std::vector<Read> rs;
++            for (int64_t i = 0; i < n_pin; i++) {
++                const int key = rank[(size_t) i].second;
++                impl->assign((int32_t) i, key);
++                impl->pinned[(size_t) i] = 1;
++                impl->reads_for(key / impl->experts, key % impl->experts, (int32_t) i, rs);
++            }
++            const bool was = impl->overlapped;
++            impl->overlapped = true;
++            for (size_t i = 0; i < rs.size(); i += 96) impl->read_all(std::vector<Read>(rs.begin() + (std::ptrdiff_t) i, rs.begin() + (std::ptrdiff_t) std::min(rs.size(), i + 96)));
++            impl->overlapped = was;
++            std::fprintf(stderr, "expert-stream: %lld experts pinned\n", (long long) n_pin);
++            // the pinning's reads are not the run's
++            impl->reads = 0;
++            impl->bytes_read = 0;
++            impl->read_ms = 0;
++        }
++        std::fprintf(stderr, "expert-stream: %lld slots (%.2f GB), %s reads%s%s\n", (long long) impl->slots,
++                     (double) impl->slots * (double) per / 1073741824.0, impl->overlapped ? "overlapped" : "synchronous",
++                     impl->contiguous ? ", contiguous file" : "", impl->prefetch ? ", prefetch" : "");
++        gguf_free(g);
++        ggml_free(meta);
++        return s;
++    }();
++    return stream;
++}
++
++ggml_tensor * ExpertStream::resolve(ggml_context * c, int layer, ggml_tensor * chosen) {
++    return ggml_map_custom1(c, ggml_cont(c, chosen), resolve_op, 1, data_for(impl_, layer));
++}
++
++ggml_tensor * ExpertStream::prefetch(ggml_context * c, int next, ggml_tensor * guess, ggml_tensor * slots) {
++    return ggml_map_custom2(c, ggml_cont(c, guess), slots, prefetch_op, 1, data_for(impl_, next));
++}
++
++}  // namespace drama3
+diff --git a/src/families/drama3/expert-stream.h b/src/families/drama3/expert-stream.h
+new file mode 100644
+index 0000000..db890e8
+--- /dev/null
++++ b/src/families/drama3/expert-stream.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "ggml.h"
++#include "model-file.h"
++
++namespace drama3 {
++
++/**
++ * Experiment (SPEECH_STREAM_MB=budget): routed experts of the CPU's layers read from the SSD into a cache of whole
++ * experts instead of held in RAM. The cache is three stacked tensors (gate, up, down) of `slots` experts; a layer's picks
++ * become slot indices, which ggml's mul_mat_id reads like expert indices, so the arithmetic and the takes are those of
++ * the experts held in RAM. Switches:
++ * - SPEECH_STREAM_PIN=f: the fraction of slots pinned, at start, to the experts the calibration routed to most
++ *   (SPEECH_STREAM_IMATRIX's row counts); the rest are least recently used.
++ * - SPEECH_STREAM_IO=sync|overlapped: misses read one after another, or all of a layer's at once (Windows overlapped,
++ *   unbuffered reads, which bypass the OS's file cache either way).
++ * - SPEECH_STREAM_FILE=path: a file of the experts laid out whole (gate, up, down back to back, 4 KiB aligned), one
++ *   read per expert instead of three; written by scorecard/tools/stream_layout.py.
++ * - SPEECH_STREAM_PREFETCH=1: the next layer's router applied to this layer's input guesses its picks, read ahead.
++ * Statistics print at exit.
++ */
++class ExpertStream {
++public:
++    /** The stream of the process for model file `m`, made on first use; null without SPEECH_STREAM_MB. */
++    static ExpertStream * get(const ModelFile & m);
++    /** Whether streaming is on (SPEECH_STREAM_MB set). */
++    static bool enabled();
++
++    ggml_tensor * gate() const { return gate_; }
++    ggml_tensor * up() const { return up_; }
++    ggml_tensor * down() const { return down_; }
++
++    /**
++     * The graph's node that turns layer `layer`'s picks `chosen`, I32 [used, rows], into cache slots, reading the missing
++     * experts; and, with prefetch, the node that reads ahead the picks `guess` of layer `next` once `slots` are resolved.
++     */
++    ggml_tensor * resolve(ggml_context * c, int layer, ggml_tensor * chosen);
++    ggml_tensor * prefetch(ggml_context * c, int next, ggml_tensor * guess, ggml_tensor * slots);
++
++    struct Impl;
++
++private:
++    ExpertStream() = default;
++    ggml_tensor *gate_ = nullptr, *up_ = nullptr, *down_ = nullptr;
++    Impl * impl_ = nullptr;
++};
++
++}  // namespace drama3
 diff --git a/src/families/drama3/layout.cpp b/src/families/drama3/layout.cpp
 index dcf803a..39a6273 100644
 --- a/src/families/drama3/layout.cpp
@@ -1539,16 +2160,17 @@ index c6bd7df..5f9d6b1 100644
      chunk.codes.resize((size_t) (codebooks * chunk.frames));
      for (int64_t f = 0; f < chunk.frames; f++)
 diff --git a/src/families/drama3/text-model.cpp b/src/families/drama3/text-model.cpp
-index d1ea780..e0b4b68 100644
+index d1ea780..c4e1004 100644
 --- a/src/families/drama3/text-model.cpp
 +++ b/src/families/drama3/text-model.cpp
-@@ -2,9 +2,22 @@
+@@ -2,9 +2,26 @@
  
  #include <algorithm>
  #include <cmath>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <map>
  #include <stdexcept>
 +#ifdef _WIN32
 +#ifndef NOMINMAX
@@ -1561,11 +2183,14 @@ index d1ea780..e0b4b68 100644
 +#endif
  
  #include "error.h"
++#include "expert-stream.h"
++#include "ggml-cpu.h"
++#include "gguf.h"
 +#include "imatrix.h"
  
  namespace drama3 {
  
-@@ -15,6 +28,18 @@ namespace {
+@@ -15,6 +32,18 @@ namespace {
   * for a block of the longest prompt, 8,192 rows of 16 heads.
   */
  constexpr int64_t kBlockRows = 512;
@@ -1584,7 +2209,7 @@ index d1ea780..e0b4b68 100644
  /** The epsilon of the official l2norm() of the Gated DeltaNet's queries and keys: x * rsqrt(sum(x^2) + 1e-6). */
  constexpr float kL2Eps = 1e-6f;
  
-@@ -22,6 +47,51 @@ std::string layer_name(int l) {
+@@ -22,8 +51,138 @@ std::string layer_name(int l) {
      return "blk." + std::to_string(l) + ".";
  }
  
@@ -1633,10 +2258,97 @@ index d1ea780..e0b4b68 100644
 +    }
 +}
 +
++/**
++ * Experiment (SPEECH_HOT_FILE=path): the sidecar hotx writes, read once into host memory: per layer the routed experts
++ * the calibration used most at a higher type (".hot") and the rest at Q4_K (".cold"), and maps from an expert id to its
++ * index in either, -1 where it is in the other, which the patched CPU mul_mat_id skips with a row of zeros.
++ */
++struct HotFile {
++    ggml_context * ctx = nullptr;
++    ggml_backend_buffer_t buf = nullptr;
++    std::map<std::string, ggml_tensor *> by_name;
++    ggml_tensor * get(const std::string & name) const {
++        const auto it = by_name.find(name);
++        return it == by_name.end() ? nullptr : it->second;
++    }
++};
++
++const HotFile * hot_file() {
++    static const HotFile * file = []() -> const HotFile * {
++        const char * path = std::getenv("SPEECH_HOT_FILE");
++        if (!path || !*path) return nullptr;
++        auto * h = new HotFile;
++        ggml_context * meta = nullptr;
++        gguf_init_params ip = {true, &meta};
++        gguf_context * g = gguf_init_from_file(path, ip);
++        if (!g) throw Error(Fault::Io, std::string("cannot read SPEECH_HOT_FILE ") + path);
++        const int64_t n = gguf_get_n_tensors(g);
++        h->ctx = ggml_init({ggml_tensor_overhead() * (size_t) (n * 2 + 8), nullptr, true});
++        std::vector<std::pair<ggml_tensor *, size_t>> at;
++        for (int64_t i = 0; i < n; i++) {
++            const char * name = gguf_get_tensor_name(g, i);
++            ggml_tensor * t = ggml_dup_tensor(h->ctx, ggml_get_tensor(meta, name));
++            ggml_set_name(t, name);
++            h->by_name[name] = t;
++            at.emplace_back(t, gguf_get_data_offset(g) + gguf_get_tensor_offset(g, i));
++        }
++        // The maps each slot tensor gives, made beside it: to_hot and to_cold, [1, experts] I32.
++        std::vector<std::string> slots;
++        for (auto & [name, t] : h->by_name) {
++            if (name.size() > 9 && name.compare(name.size() - 9, 9, "exps_slot") == 0) slots.push_back(name);
++        }
++        for (const std::string & s : slots) {
++            const int64_t experts = h->by_name[s]->ne[0];
++            const std::string p = s.substr(0, s.size() - 9);
++            for (const char * m : {"to_hot", "to_cold"}) {
++                ggml_tensor * t = ggml_new_tensor_2d(h->ctx, GGML_TYPE_I32, 1, experts);
++                ggml_set_name(t, (p + m).c_str());
++                h->by_name[p + m] = t;
++            }
++        }
++        h->buf = ggml_backend_alloc_ctx_tensors_from_buft(h->ctx, ggml_backend_cpu_buffer_type());
++        if (!h->buf) throw Error(Fault::OutOfMemory, std::string("cannot allocate the hot experts of ") + path);
++        ggml_backend_buffer_set_usage(h->buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++        FILE * f = std::fopen(path, "rb");
++        if (!f) throw Error(Fault::Io, std::string("cannot open ") + path);
++        for (auto & [t, offset] : at) {
++#ifdef _WIN32
++            _fseeki64(f, (long long) offset, SEEK_SET);
++#else
++            fseeko(f, (off_t) offset, SEEK_SET);
++#endif
++            if (std::fread(t->data, 1, ggml_nbytes(t), f) != ggml_nbytes(t)) throw Error(Fault::File, std::string("short read in ") + path);
++        }
++        std::fclose(f);
++        for (const std::string & s : slots) {
++            const std::string p = s.substr(0, s.size() - 9);
++            const ggml_tensor * slot = h->by_name[s];
++            auto * to_hot = (int32_t *) h->by_name[p + "to_hot"]->data, * to_cold = (int32_t *) h->by_name[p + "to_cold"]->data;
++            const auto * v = (const int32_t *) slot->data;
++            for (int64_t e = 0; e < slot->ne[0]; e++) {
++                to_hot[e] = v[e] >= 0 ? v[e] : -1;
++                to_cold[e] = v[e] < 0 ? -1 - v[e] : -1;
++            }
++        }
++        gguf_free(g);
++        ggml_free(meta);
++        std::fprintf(stderr, "experiment: hot experts of %zu layers from %s (%.2f GB)\n", slots.size(), path, ggml_backend_buffer_get_size(h->buf) / 1073741824.0);
++        return h;
++    }();
++    return file;
++}
++
  }  // namespace
  
++bool hot_file_covers(int layer) {
++    const HotFile * h = hot_file();
++    return h && h->get("blk." + std::to_string(layer) + ".exps_slot");
++}
++
  /**
-@@ -92,9 +162,119 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
+  * The recurrent state of each Gated DeltaNet layer of the run, [key dim, value dim, value heads] with the key channel
+  * fastest as ggml_gated_delta_net() keeps it, and the inputs of its convolution's last rows, [width - 1, channels].
+@@ -92,9 +251,119 @@ TextModel::TextModel(const ModelFile & m, ggml_backend_t backend, int first, int
          ggml_backend_t backends[] = {backend_, cpu};
          // Without offloading the prompt's experts to the GPU: copying a layer's experts over for a prompt of 46 rows
          // made it take 2.5 s where the CPU took 1.0 s, on an RTX 2080 with Vulkan and an i9-9900K (2026-10-15).
@@ -1671,7 +2383,7 @@ index d1ea780..e0b4b68 100644
 +        }
 +        t.experts = experts_;
 +        t.usable = host;  // only weights the CPU reads in place; a GPU copy needs no advice
-+    }
+     }
 +    return t.usable ? &t : nullptr;
 +}
 +
@@ -1752,12 +2464,12 @@ index d1ea780..e0b4b68 100644
 +        ggml_backend_tensor_set(h.to_slot, to_slot.data(), 0, ggml_nbytes(h.to_slot));
 +        ggml_backend_tensor_set(h.to_cpu, to_cpu.data(), 0, ggml_nbytes(h.to_cpu));
 +        ggml_backend_tensor_set(h.is_hot, is_hot.data(), 0, ggml_nbytes(h.is_hot));
-     }
++    }
 +    std::fprintf(stderr, "experiment: %d hot experts (%.2f GB) copied to %s\n", taken, used_bytes / 1073741824.0, ggml_backend_name(backend_));
  }
  
  TextModel::~TextModel() {
-@@ -195,25 +375,123 @@ ggml_tensor * TextModel::delta_mixer(Graph & g, int l, ggml_tensor * x) {
+@@ -195,25 +464,150 @@ ggml_tensor * TextModel::delta_mixer(Graph & g, int l, ggml_tensor * x) {
      return mul_mat(c, m_.tensor(p + "ssm_out"), ggml_reshape_2d(c, core, (int64_t) value_heads_ * value_dim_, n));
  }
  
@@ -1854,7 +2566,34 @@ index d1ea780..e0b4b68 100644
 -    ggml_tensor * down = mul_mat_id(c, m_.tensor(p + "ffn_down_exps"), ggml_mul(c, ggml_silu(c, gate), up), chosen);
 -    down = ggml_mul(c, down, weights);
 +    ggml_tensor * down = nullptr;
-+    if (!hot_.empty() && hot_[(size_t) l].gate) {
++    // Experiment (SPEECH_HOT_FILE): a layer whose routed experts the sidecar holds, the main file's left unloaded.
++    const HotFile * hf = m_.loaded(p + "ffn_gate_exps") ? nullptr : hot_file();
++    // Experiment (SPEECH_STREAM_MB): a CPU layer whose routed experts are read from the SSD into the stream's cache.
++    ExpertStream * st = m_.loaded(p + "ffn_gate_exps") || hf ? nullptr : ExpertStream::get(m_);
++    if (st) {
++        ggml_tensor * slots = st->resolve(c, l, chosen);
++        ggml_tensor * gate = mul_mat_id(c, st->gate(), rows, slots);
++        ggml_tensor * up = mul_mat_id(c, st->up(), rows, slots);
++        down = ggml_mul(c, mul_mat_id(c, st->down(), ggml_mul(c, ggml_silu(c, gate), up), slots), weights);
++        // SPEECH_STREAM_PREFETCH=d: layer l + d's router on this layer's input guesses its picks, read ahead.
++        static const int ahead = [] { const char * v = std::getenv("SPEECH_STREAM_PREFETCH"); return v ? std::atoi(v) : 0; }();
++        if (ahead > 0 && l + ahead < last_ && !m_.loaded(layer_name(l + ahead) + "ffn_gate_exps")) {
++            ggml_tensor * guess = ggml_top_k(c, ggml_soft_max(c, mul_mat(c, m_.tensor(layer_name(l + ahead) + "ffn_gate_inp"), x)), used_);
++            g.output(st->prefetch(c, l + ahead, guess, slots));
++        }
++    } else if (hf) {
++        ggml_tensor * flat = ggml_reshape_1d(c, ggml_cont(c, chosen), used_ * n);
++        ggml_tensor * ids_hot = ggml_reshape_2d(c, ggml_get_rows(c, hf->get(p + "to_hot"), flat), used_, n);
++        ggml_tensor * ids_cold = ggml_reshape_2d(c, ggml_get_rows(c, hf->get(p + "to_cold"), flat), used_, n);
++        const auto part = [&](const char * which, ggml_tensor * ids) {
++            const std::string q = std::string(which);
++            ggml_tensor * gate = mul_mat_id(c, hf->get(p + "ffn_gate_exps" + q), rows, ids);
++            ggml_tensor * up = mul_mat_id(c, hf->get(p + "ffn_up_exps" + q), rows, ids);
++            return mul_mat_id(c, hf->get(p + "ffn_down_exps" + q), ggml_mul(c, ggml_silu(c, gate), up), ids);
++        };
++        // A pick the other part holds is -1 here, a row of zeros.
++        down = ggml_mul(c, ggml_add(c, part(".hot", ids_hot), part(".cold", ids_cold)), weights);
++    } else if (!hot_.empty() && hot_[(size_t) l].gate) {
 +        // Each pick goes to the device's copy when hot and to the CPU's tensor when cold; the other path computes it
 +        // from the zero slot (device) or skips it (CPU, id -1), and the hot weights select which result counts.
 +        const HotLayer & hl = hot_[(size_t) l];
@@ -1885,7 +2624,7 @@ index d1ea780..e0b4b68 100644
      ggml_tensor * shared = mul_mat(c, m_.tensor(p + "ffn_down_shexp"),
                                     ggml_mul(c, ggml_silu(c, mul_mat(c, m_.tensor(p + "ffn_gate_shexp"), x)), mul_mat(c, m_.tensor(p + "ffn_up_shexp"), x)));
      shared = ggml_mul(c, shared, ggml_sigmoid(c, mul_mat(c, m_.tensor(p + "ffn_gate_inp_shexp"), x)));
-@@ -250,7 +528,20 @@ ggml_tensor * TextModel::build_embed(Graph & g, const std::vector<int32_t> & fra
+@@ -250,7 +644,20 @@ ggml_tensor * TextModel::build_embed(Graph & g, const std::vector<int32_t> & fra
          }
      }
      ggml_context * c = g.ctx();
@@ -1907,7 +2646,7 @@ index d1ea780..e0b4b68 100644
      if (seen_ > 0) {
          ggml_tensor * rows = ggml_get_rows(c, m_.tensor("ad.codebook_embd"), g.input(seen, (int64_t) seen.size()));
          ggml_tensor * mixed = e;
-@@ -278,6 +569,20 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
+@@ -278,6 +685,20 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
                                       stages ? &kept : nullptr);
          if (sched_) g.compute(sched_);
          else g.compute(backend_, allocr_);
@@ -1928,7 +2667,7 @@ index d1ea780..e0b4b68 100644
          if (stages) {
              for (int i = 0; i < count; i++) {
                  std::vector<float> * where[] = {&stages->mixer[(size_t) i], &stages->router[(size_t) i], &stages->moe[(size_t) i],
-@@ -298,6 +603,8 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
+@@ -298,6 +719,8 @@ std::vector<float> TextModel::run(const std::vector<float> & input, int64_t n, T
  ggml_tensor * TextModel::build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept) {
      ggml_context * c = g.ctx();
      const int64_t rows = x->ne[1];
@@ -1937,7 +2676,7 @@ index d1ea780..e0b4b68 100644
      // A graph holds only the inputs its nodes read, and only attention reads the positions and the mask.
      const bool attends = std::count(types_.begin() + first_, types_.begin() + last_, true) > 0;
      ggml_tensor * pos = attends ? positions(g, n_past_, rows) : nullptr;
-@@ -348,6 +655,43 @@ std::vector<float> TextModel::logits(const std::vector<float> & hidden) {
+@@ -348,6 +771,43 @@ std::vector<float> TextModel::logits(const std::vector<float> & hidden) {
      return Graph::read(l);
  }
  
@@ -1982,10 +2721,20 @@ index d1ea780..e0b4b68 100644
      return Graph::read(states_->delta[(size_t) slot_[(size_t) l]]);
  }
 diff --git a/src/families/drama3/text-model.h b/src/families/drama3/text-model.h
-index 114488c..734e99f 100644
+index 114488c..7177f64 100644
 --- a/src/families/drama3/text-model.h
 +++ b/src/families/drama3/text-model.h
-@@ -84,6 +84,18 @@ public:
+@@ -13,6 +13,9 @@
+ 
+ namespace drama3 {
+ 
++/** Experiment (SPEECH_HOT_FILE): whether the hot-expert sidecar holds layer `layer`'s routed experts. */
++bool hot_file_covers(int layer);
++
+ /**
+  * What the layers of a run computed on the way, by layer, each [width, rows] with the channel fastest: the attention's
+  * or the Gated DeltaNet's output, the router's logits, the experts' output with the shared expert's, and the layer's
+@@ -84,6 +87,18 @@ public:
      /** The head's logits of `hidden`, [hidden] after the final norm, over drama3.output.token_ids. */
      std::vector<float> logits(const std::vector<float> & hidden);
  
@@ -2004,7 +2753,7 @@ index 114488c..734e99f 100644
      /**
       * Gated DeltaNet layer `l`'s recurrent state, [key dim, value dim, value heads] with the key channel fastest, and the
       * inputs of its convolution's last rows, [width - 1, channels] with the row fastest: what a check compares with the
-@@ -106,6 +118,38 @@ private:
+@@ -106,6 +121,38 @@ private:
      ggml_tensor * build_rows(Graph & g, ggml_tensor * x, std::vector<std::vector<ggml_tensor *>> * kept);
      /** The experts and the shared expert on `x`, and the router's logits in `router`. */
      ggml_tensor * experts(Graph & g, int l, ggml_tensor * x, ggml_tensor ** router);
@@ -2043,6 +2792,181 @@ index 114488c..734e99f 100644
  
      ggml_backend_t backend_;
      const ModelFile & m_;
+diff --git a/tools/hotx/hotx.cpp b/tools/hotx/hotx.cpp
+new file mode 100644
+index 0000000..631f9fd
+--- /dev/null
++++ b/tools/hotx/hotx.cpp
+@@ -0,0 +1,169 @@
++// Experiment: writes a sidecar of Drama 3's routed experts split by use. Per layer, the experts the English calibration
++// routed to most (a fraction of them, by the importance matrix's row counts) go to a higher type, the rest to Q4_K, both
++// from the F16 file with the importance matrix weighting the rounding.
++//
++//   hotx F16.gguf imatrix.simx OUT.gguf FRACTION TYPE      (TYPE: q5_K or q6_K)
++//
++// Per layer l, the sidecar holds blk.l.ffn_{gate,up,down}_exps.hot [.., .., hot] in TYPE, blk.l.ffn_{gate,up,down}_exps.cold
++// [.., .., cold] in Q4_K, and blk.l.exps_slot, I32 [experts]: the expert's index among the hot ones, or -1 - its index
++// among the cold ones. The engine reads it with SPEECH_HOT_FILE in place of the main file's routed experts.
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <numeric>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "ggml.h"
++#include "gguf.h"
++#include "imatrix.h"
++
++namespace {
++
++ggml_type type_named(const std::string & name) {
++    for (int k = 0; k < GGML_TYPE_COUNT; k++) {
++        const char * tn = ggml_type_name((ggml_type) k);
++        if (tn && name == tn) return (ggml_type) k;
++    }
++    throw std::runtime_error("no ggml type is named " + name);
++}
++
++/** Quantizes `experts` of the F32 [k, n, all] tensor `values` into `type`, each with its importance weights. */
++std::vector<uint8_t> quantize(const std::vector<float> & values, int64_t k, int64_t n, const std::vector<int> & experts, ggml_type type,
++                              const Imatrix & im, const std::string & name) {
++    const size_t per = ggml_row_size(type, k) * (size_t) n;
++    std::vector<uint8_t> out(per * experts.size());
++    std::vector<std::thread> threads;
++    const int nt = (int) std::max(1u, std::thread::hardware_concurrency());
++    for (int t = 0; t < nt; t++) {
++        threads.emplace_back([&, t] {
++            for (size_t i = (size_t) t; i < experts.size(); i += (size_t) nt) {
++                const std::vector<float> w = im.weights(name, experts[i], k);
++                const float * src = values.data() + (size_t) experts[i] * (size_t) (k * n);
++                ggml_quantize_chunk(type, src, out.data() + i * per, 0, n, k, w.empty() ? nullptr : w.data());
++            }
++        });
++    }
++    for (auto & th : threads) th.join();
++    return out;
++}
++
++}  // namespace
++
++int main(int argc, char ** argv) {
++    if (argc != 6) {
++        std::fprintf(stderr, "usage: hotx F16.gguf imatrix.simx OUT.gguf FRACTION TYPE\n");
++        return 2;
++    }
++    const std::string in = argv[1], out = argv[3];
++    const double fraction = std::atof(argv[4]);
++    const ggml_type hot_type = type_named(argv[5]);
++    ggml_context * meta = nullptr;
++    gguf_init_params ip = {true, &meta};
++    gguf_context * src = gguf_init_from_file(in.c_str(), ip);
++    if (!src) throw std::runtime_error("cannot read " + in);
++    Imatrix im;
++    im.load(argv[2]);
++    const int64_t layers = gguf_get_val_u32(src, gguf_find_key(src, "drama3.text.num_hidden_layers"));
++
++    // The sidecar's tensors, described first so that its header can be written before the data.
++    ggml_init_params cp = {ggml_tensor_overhead() * (size_t) (layers * 7 + 1), nullptr, true};
++    ggml_context * ctx = ggml_init(cp);
++    gguf_context * dst = gguf_init_empty();
++    gguf_set_val_str(dst, "general.architecture", "drama3-hot-experts");
++    gguf_set_val_f32(dst, "hot.fraction", (float) fraction);
++    gguf_set_val_str(dst, "hot.type", ggml_type_name(hot_type));
++    struct Plan {
++        std::string name;
++        int64_t layer;
++        std::vector<int> hot, cold;
++    };
++    std::vector<Plan> plans;
++    for (int64_t l = 0; l < layers; l++) {
++        const std::string p = "blk." + std::to_string(l) + ".";
++        const ggml_tensor * gate = ggml_get_tensor(meta, (p + "ffn_gate_exps").c_str());
++        const int64_t experts = gate->ne[2];
++        // Hot: the most-routed experts by the calibration's row counts.
++        const auto it = im.entries.find(p + "ffn_gate_exps");
++        if (it == im.entries.end()) throw std::runtime_error("the importance matrix has no " + p + "ffn_gate_exps");
++        std::vector<int> order((size_t) experts);
++        std::iota(order.begin(), order.end(), 0);
++        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return it->second.rows[(size_t) a] > it->second.rows[(size_t) b]; });
++        const int n_hot = (int) std::lround(fraction * (double) experts);
++        Plan plan{p, l, {order.begin(), order.begin() + n_hot}, {order.begin() + n_hot, order.end()}};
++        std::sort(plan.hot.begin(), plan.hot.end());
++        std::sort(plan.cold.begin(), plan.cold.end());
++        for (const char * m : {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}) {
++            const ggml_tensor * full = ggml_get_tensor(meta, (p + m).c_str());
++            for (int part = 0; part < 2; part++) {
++                const int64_t count = part == 0 ? (int64_t) plan.hot.size() : (int64_t) plan.cold.size();
++                ggml_tensor * t = ggml_new_tensor_3d(ctx, part == 0 ? hot_type : GGML_TYPE_Q4_K, full->ne[0], full->ne[1], count);
++                ggml_set_name(t, (p + m + (part == 0 ? ".hot" : ".cold")).c_str());
++                gguf_add_tensor(dst, t);
++            }
++        }
++        ggml_tensor * slot = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, experts);
++        ggml_set_name(slot, (p + "exps_slot").c_str());
++        gguf_add_tensor(dst, slot);
++        plans.push_back(std::move(plan));
++    }
++    FILE * f = std::fopen(out.c_str(), "wb");
++    if (!f) throw std::runtime_error("cannot create " + out);
++    std::vector<uint8_t> header(gguf_get_meta_size(dst));
++    gguf_get_meta_data(dst, header.data());
++    std::fwrite(header.data(), 1, header.size(), f);
++    const size_t align = gguf_get_alignment(dst);
++    size_t written = 0;  // bytes of data so far, against the offsets the header gives
++    const auto put = [&](const std::vector<uint8_t> & bytes, const std::string & name) {
++        const int64_t id = gguf_find_tensor(dst, name.c_str());
++        const size_t at = gguf_get_tensor_offset(dst, id);
++        if (at < written) throw std::logic_error("tensor " + name + " out of order");
++        const std::vector<uint8_t> pad(at - written, 0);
++        std::fwrite(pad.data(), 1, pad.size(), f);
++        if (std::fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size()) throw std::runtime_error("cannot write " + out);
++        written = at + bytes.size();
++    };
++
++    FILE * in_f = std::fopen(in.c_str(), "rb");
++    if (!in_f) throw std::runtime_error("cannot open " + in);
++    const size_t data_at = gguf_get_data_offset(src);
++    std::vector<ggml_fp16_t> halves;
++    std::vector<float> values;
++    for (const Plan & plan : plans) {
++        for (const char * m : {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}) {
++            const std::string name = plan.name + m;
++            const int64_t id = gguf_find_tensor(src, name.c_str());
++            const ggml_tensor * full = ggml_get_tensor(meta, name.c_str());
++            if (full->type != GGML_TYPE_F16) throw std::runtime_error(name + " is not F16");
++            halves.resize((size_t) ggml_nelements(full));
++#ifdef _WIN32
++            _fseeki64(in_f, (long long) (data_at + gguf_get_tensor_offset(src, id)), SEEK_SET);
++#else
++            fseeko(in_f, (off_t) (data_at + gguf_get_tensor_offset(src, id)), SEEK_SET);
++#endif
++            if (std::fread(halves.data(), sizeof(ggml_fp16_t), halves.size(), in_f) != halves.size()) throw std::runtime_error("short read of " + name);
++            values.resize(halves.size());
++            ggml_fp16_to_fp32_row(halves.data(), values.data(), (int64_t) values.size());
++            put(quantize(values, full->ne[0], full->ne[1], plan.hot, hot_type, im, name), name + ".hot");
++            put(quantize(values, full->ne[0], full->ne[1], plan.cold, GGML_TYPE_Q4_K, im, name), name + ".cold");
++        }
++        std::vector<int32_t> slot(plan.hot.size() + plan.cold.size());
++        for (size_t i = 0; i < plan.hot.size(); i++) slot[(size_t) plan.hot[i]] = (int32_t) i;
++        for (size_t i = 0; i < plan.cold.size(); i++) slot[(size_t) plan.cold[i]] = -1 - (int32_t) i;
++        std::vector<uint8_t> bytes(slot.size() * sizeof(int32_t));
++        std::memcpy(bytes.data(), slot.data(), bytes.size());
++        put(bytes, plan.name + "exps_slot");
++        std::fprintf(stderr, "layer %lld: %zu hot, %zu cold\n", (long long) plan.layer, plan.hot.size(), plan.cold.size());
++    }
++    const std::vector<uint8_t> tail(GGML_PAD(written, align) - written, 0);
++    std::fwrite(tail.data(), 1, tail.size(), f);
++    std::fclose(f);
++    std::fclose(in_f);
++    std::fprintf(stderr, "wrote %s\n", out.c_str());
++    return 0;
++}
 diff --git a/tools/worker/worker.cpp b/tools/worker/worker.cpp
 index 2661928..19358a0 100644
 --- a/tools/worker/worker.cpp

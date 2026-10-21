@@ -16,7 +16,7 @@ import time
 import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from worker import Worker, read_jsonl  # noqa: E402
+from worker import Sampler, Worker, read_jsonl  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -55,7 +55,8 @@ def main():
     w = Worker(a.binary, a.model, ["--threads", str(a.threads)] if a.threads else [], stderr_path=os.path.join(out, "worker.stderr.log"))
     sr = w.ready["model"].get("sample_rate", 44100)
     vram_ready = vram_used_mib()
-    pcm = {f"{i}-s{s}": [] for i, s in jobs}
+    sampler = Sampler(w.proc.pid)
+    pcm ={f"{i}-s{s}": [] for i, s in jobs}
     t0 = time.monotonic()
     for i, s in jobs:
         w._send({"type": "synthesize", "id": f"{i}-s{s}", "text": texts[i], "voice": "none", "seed": s})
@@ -71,6 +72,7 @@ def main():
             stops[rid] = msg.get("stop", msg["type"])
             done += 1
     wall = time.monotonic() - t0
+    mem = sampler.stop()
     w.close()
     audio = 0.0
     for rid, parts in pcm.items():
@@ -81,7 +83,8 @@ def main():
     res = {"tag": a.tag, "streams": a.streams, "takes": len(jobs), "audio_s": round(audio, 1), "wall_s": round(wall, 1),
            "throughput_rtfx": round(audio / wall, 3), "load_s": round(w.load_s, 1),
            "not_complete": sum(1 for v in stops.values() if v != "complete"),
-           "vram_idle_mib": vram_before, "vram_ready_mib": vram_ready, "vram_peak_mib": vram_peak}
+           "vram_idle_mib": vram_before, "vram_ready_mib": vram_ready, "vram_peak_mib": vram_peak,
+           "ram_peak_gb": round(mem["rss_kb"] / 1048576, 2)}
     json.dump(res, open(os.path.join(out, "tp.json"), "w"), indent=2)
     print(json.dumps(res))
 
