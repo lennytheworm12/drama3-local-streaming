@@ -9,7 +9,8 @@ The target use is offline narration: script in, audio file out. The project has 
 **Best setup so far: native Windows Vulkan build of speech.cpp with our patches and an English-imatrix mixed-precision file (routed experts Q4_K, the rest Q6_K/Q8_0, 21.8 GB). One take runs at 0.77× realtime, and four takes side by side give 1.24–1.27× realtime throughput** (stock under WSL: 0.44×, 287 s to start, 16 GB). Full numbers in [RESULTS.md](RESULTS.md).
 
 - **mmap loader**: startup in seconds instead of minutes, bit-identical output, and the model runs under a 16 GB RAM cap where the stock loader is OOM-killed.
-- **SSD streaming works**, and prefetching the router's chosen experts makes it 1.5–2.25× faster under a RAM cap.
+- **SSD streaming works.** On native Windows, a whole-expert LRU cache with overlapped unbuffered reads runs at 0.40× / 0.34× / 0.27× realtime in 12 / 10 / 8 GB of RAM (`narrate.cmd --ram-gb N`), with takes identical to the in-RAM run. Overlapped reads were the win (+60–95%); pinning hot experts, a contiguous layout and read-ahead didn't help.
+- **Hot experts at Q6_K** (`narrate.cmd --hot q6`): the 30% most-routed experts per layer at a higher type halve the main token's KL again (top-token match 93.1%) for about 13% speed.
 - **The speed limit is the GPU↔CPU handoff and small GPU dispatches**, so what helps is fitting more layers on the GPU and a cheaper handoff (native Windows rather than WSL).
 - **Fused audio decoder, freed VRAM and flash attention** took one Q4_K take from 0.65× to 0.77×. The VRAM savings (half-precision caches sized for a line, `token_embd` on the CPU) are also what made four concurrent takes fit.
 - **An English importance matrix, with Q6_K outside the experts**, cuts the error against F16 to a fraction at the same speed and +1 GB: main-token KL 0.027 against 0.073 for the published Q4_K (top-token match 86.1% against 75.0%), and codebook KL 0.019 against 0.156 (match 83.2% against 53.1%). It's the default model now. Four takes peak at 7.4 of 8 GB VRAM, so use `--streams 3` with other GPU apps open. Bi's blind listen against the published file is pending.
@@ -54,7 +55,7 @@ This repo holds patches, scripts and measurements only. It does not include the 
 
 1. **Baseline.** Done: 0.4× realtime, 16 GB anonymous RAM, no streaming (speech.cpp reads the whole file with fread), OOM under a 16 GB cap.
 2. **Expert usage logging.** Done: routing is broad (90% of experts used), and the hot set is general, not workload-specific.
-3. **Tiered cache.** mmap streaming and router-driven prefetch: done and working. Hot experts in VRAM: works but gains only 8% and is unstable, because the per-layer handoff dominates.
+3. **Tiered cache.** Done: mmap streaming with router prefetch under WSL, then a native Windows expert cache with overlapped SSD reads (`--ram-gb`). Hot experts in VRAM: works but gains only 8% and is unstable, because the per-layer handoff dominates.
 4. **Smaller experts and native Windows.** Done: native Vulkan beats CUDA in WSL, and Q2_K experts are the fast, low-RAM option.
 5. **Quality check.** KL fidelity, two public benchmarks and two blind listening tests (the second with a fixed voice file): done. Q4_K is the quality default.
 6. **Q4_K speed.** Done: fused audio decoder, VRAM spill fix, freed VRAM, flash attention. 0.77× for one take.

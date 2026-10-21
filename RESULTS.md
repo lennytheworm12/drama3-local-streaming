@@ -24,8 +24,10 @@ low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voic
 2. **The speed limit is the GPU↔CPU handoff, about 1.1 ms per CPU-computed layer per frame**, not CPU compute. Threads,
    polling and moving individual hot experts to the GPU barely move it. Fewer CPU layers (smaller experts, so more
    layers fit in VRAM) and a cheaper handoff (native Windows instead of WSL) do.
-3. **SSD streaming works but costs speed**, and router-driven prefetch recovers most of it: 1.5–2.25× faster under a
-   RAM cap, with 7× fewer page faults.
+3. **SSD streaming works but costs speed.** Under WSL, router-driven prefetch made mmap streaming 1.5–2.25× faster under
+   a RAM cap. On native Windows, a whole-expert LRU cache with overlapped unbuffered reads does better: 0.40× / 0.34× /
+   0.27× realtime in 12 / 10 / 8 GB of RAM (`narrate.cmd --ram-gb N`), against 0.76× with everything in RAM. Takes are
+   bit-identical to the in-RAM run.
 4. **Q2_K experts: 1.4× faster at 55% of the RAM, but they cost intonation.** About +0.6 WER points in English and +1.7
    kana-CER points in Japanese. The first blind test (random voices) rated Q2_K highest; the second (one fixed voice)
    preferred Q4_K, 69% against 44% "would watch", and every one of Bi's notes was on a Q2_K take. Q4_K is the quality
@@ -39,7 +41,9 @@ low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voic
    match 86.1% against 75.0%) and codebook KL 0.019 against 0.156 (match 83.2% against 53.1%), for +1 GB. The old
    codebook "floor" was the audio decoder's Q4_K. It is narrate.py's default model; Bi's blind listen against the
    published file is pending.
-8. **Many things didn't help**: CPU expert repacking, one graph per frame, op fusion, Vulkan driver switches, Q8_0
+8. **Hot experts at Q6_K** (the 30% most-routed per layer, in a sidecar) halve the main token's KL again (top-1 93.1%
+   against 87.5%) for about 13% speed. Opt-in with `narrate.cmd --hot q6`.
+9. **Many things didn't help**: CPU expert repacking, one graph per frame, op fusion, Vulkan driver switches, Q8_0
    (5–6× slower), self-draft speculative decoding (about 5% acceptance), the shared expert on the GPU beside the CPU
    experts, and a native CUDA build (no faster than Vulkan).
 
@@ -396,6 +400,57 @@ KL against F16, the same 6 held-out sentences:
   on the GPU, use `--streams 3`. `--model win\Drama-35B-A3B-v3-Q4_K.gguf` restores the published file.
 - **Bi's blind A/B (the published Q4_K against imx2-mix) is pending.**
 
+## Hot experts at a higher type
+
+`tools/hotx` writes a sidecar from F16 with the round-2 imatrix. Per layer, the 77 of 256 experts (30%) the calibration
+routed to most are stored at Q5_K or Q6_K, the other 179 at Q4_K, plus slot maps ([`hotx_run.sh`](scorecard/tools/hotx_run.sh)).
+`SPEECH_HOT_FILE` loads it in place of the main file's experts for the CPU layers. Each pick goes to the hot or the cold
+tensor, with -1 in the other, which the patched CPU `mul_mat_id` turns into a zero row (so this needs the ggml patch).
+
+All 40 layers on the CPU, 6 held-out sentences, against F16:
+
+| | main KL | main top-1 | codebook KL | codebook top-1 | 1 stream | 4 streams | RAM peak |
+|---|---|---|---|---|---|---|---|
+| imx2-mix | 0.0232 | 87.5% | 0.0162 | 83.7% | 0.664× | 1.232× | 17.7 GB |
+| + hot Q5_K (experts 19.3 GB) | 0.0139 | 88.3% | 0.0111 | 85.8% | 0.604× | 1.149× | 18.8 GB |
+| + hot Q6_K (experts 20.6 GB) | **0.0132** | **93.1%** | 0.0126 | 85.3% | 0.574× | 1.069× | 20.0 GB |
+
+- Q6_K hot experts halve the main token's KL; five of six sentences fall to about 0.006.
+- The cost is about 13% speed, because the CPU's expert reads are bound by RAM bandwidth.
+- It is opt-in: `narrate.cmd --hot q6` (or `q5`). The default stays imx2-mix.
+
+## SSD streaming on native Windows
+
+`SPEECH_STREAM_MB` (`src/families/drama3/expert-stream.cpp`): the CPU layers' routed experts are not loaded. A cache of whole
+experts (three stacked tensors, gate/up/down, by slot) takes their place. A custom op turns each layer's picks into slots
+and reads misses with unbuffered reads (`FILE_FLAG_NO_BUFFERING`, so Windows' file cache can't hide the SSD); `mul_mat_id`
+then reads the cache like the expert tensors. The cache is the RAM cap less the 1.8 GB the process takes without its experts.
+
+1 stream, 5 GPU expert layers, 10 takes each, peak working set measured under every cap. **All 31 runs gave takes
+identical to the in-RAM run (WAV hashes).**
+
+| step (cumulative) | 12 GB (peak 11.1) | 10 GB (peak 9.1) | 8 GB (peak 7.1) |
+|---|---|---|---|
+| in RAM (15.6 GB) | 0.758× | | |
+| LRU, synchronous reads | 0.248×, hits 92.1% | 0.192×, 87.1% | 0.134×, 80.3% |
+| + 60% of slots pinned to the calibration's hottest experts (`SPEECH_STREAM_PIN`) | 0.247×, 91.2% | 0.184×, 86.6% | 0.114×, 79.1% |
+| + overlapped reads, a layer's misses at once (`SPEECH_STREAM_IO=overlapped`) | 0.395× | 0.327× | 0.261× |
+| + contiguous file, one 1.77 MB read per expert (`SPEECH_STREAM_FILE`, [`stream_layout.py`](scorecard/tools/stream_layout.py)) | 0.405× | 0.336× | 0.230× |
+| + read ahead the next layer's guessed picks, waiting for all (`SPEECH_STREAM_PREFETCH`) | 0.375×, hits 94.9% | 0.303×, 91.7% | 0.227×, 87.3% |
+| **overlapped LRU alone, no pin** | — | **0.340×** | **0.273×** |
+| + read-ahead, waiting only for picked slots, distance 1 / 2 | — | 0.314× / 0.301× | 0.159× / 0.186× |
+
+- **Overlapped reads give +60–95% at every cap.** Synchronous reads ran at about 0.5 GB/s, overlapped at 1.4–1.6 GB/s:
+  the P3 needs queue depth.
+- **Pinning by the calibration's counts lost to plain LRU at every cap.** Recency predicts a text's use better than global counts.
+- **The contiguous layout** helped slightly at 12 and 10 GB and hurt at 8 GB, where fewer, larger reads give less queue depth.
+- **Read-ahead raised hit rates by 3–9 points but always lost speed.** 30–45% of guesses were wrong, the extra reads (up to
+  1.5× the bytes) crowded the SSD, and the next layer starts about 1 ms later, too soon to hide a read.
+- Against the earlier WSL streaming (mmap with same-layer prefetch: 0.32× / 0.23× / 0.18× at 12 / 10 / 8 GB), native
+  overlapped LRU is 0.40× / 0.34× / 0.27×.
+- **Adopted:** `narrate.cmd --ram-gb N` (overlapped LRU, one take at a time). A check at 8 GB with the voice file: hit
+  rate 85%, 1.5 GB/s while reading.
+
 ## Expert prefetch from the router (`SPEECH_PREFETCH_EXPERTS`)
 
 A CPU custom op passes the router's picks through and asks the OS to read the chosen experts' slices
@@ -485,6 +540,8 @@ voice file with `speech voice`. It holds: ECAPA similarity to the reference is 0
 - On an 8 GB card a single take is near its floor (0.77×). Throughput comes from running takes side by side, which
   suits narration, since several takes per line are wanted anyway.
 - Use the mmap loader when RAM is short; fread is steadier when other apps press on memory on Windows.
+- `--hot q6` brings the model closer to F16 (main top-1 93%) for about 13% speed; `--ram-gb N` runs in 8–12 GB of RAM at
+  0.27–0.40×.
 - Next: Bi's blind listen of imx2-mix against the published Q4_K; batched multi-take decoding (one handoff per layer for every take), the
   remaining throughput lever; imatrix versions of the smaller expert mixes (IQ4_XS, Q2_K on some layers), judged by KL
   first and then by ear.

@@ -18,7 +18,7 @@ cd speech.cpp
 git checkout eacabcd
 git submodule update --init --recursive
 git apply path\to\drama3-local-streaming\patches\speech.cpp-exp.diff
-rem Optional: scheduler timing and the hot-expert tiering experiment:
+rem Needed for hot experts (--hot) and scheduler timing:
 git -C ggml apply ..\..\drama3-local-streaming\patches\ggml-experiments.diff
 ```
 
@@ -56,6 +56,7 @@ Use 8 layers when nothing else holds VRAM. For several takes at once, run `speec
 
 [`narrate.cmd`](../narrate.cmd) wraps all of this for a text file: one segment per line, several takes per segment
 generated four at a time (`--streams 3` with other GPU apps open), and a stitched `narration.wav` of the first usable take of each.
+`--hot q6` uses a hot-expert sidecar, and `--ram-gb 8` streams the experts from the SSD to fit in 8 GB of RAM.
 
 ## Notes from getting it working
 
