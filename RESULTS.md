@@ -10,8 +10,8 @@ automatic MOS predictor (1–5).
 
 ## Summary
 
-**Best setup on this PC: native Windows Vulkan with the published Q4_K, the fused audio decoder, half-precision caches
-sized for a line, `token_embd` on the CPU and flash attention.** One take runs at **0.77× realtime** with 8 layers' experts
+**Best setup on this PC: native Windows Vulkan with an English-imatrix Q4_K, the fused audio decoder, half-precision
+caches sized for a line, `token_embd` on the CPU, flash attention and pinned handoff memory.** One take runs at **0.77× realtime** with 8 layers' experts
 on the GPU (stock under WSL: 0.44×). Four takes side by side, every expert on the CPU, give **1.24–1.27× realtime
 throughput**. [`narrate.cmd`](narrate.cmd) uses the four-stream setup by default. Q2_K experts remain the
 low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voice found they flatten intonation.
@@ -32,8 +32,12 @@ low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voic
    subset to prune or pin.
 6. **Several takes at once was held back by VRAM, not by the GPU.** Freeing 1.6 GB per stream (F16 cache, caches sized
    for a line, `token_embd` on the CPU) took two streams from 0.80× to 0.98× and made room for four (1.27×).
-7. **Many things didn't help**: CPU expert repacking, one graph per frame, op fusion, Vulkan driver switches, Q8_0
-   (5–6× slower) and self-draft speculative decoding (about 5% acceptance).
+7. **An English importance matrix halves Q4_K's error at no cost**: main-token KL from F16 0.032 against 0.073 for the
+   published Q4_K on 6 held-out sentences, top-token match 83.6% against 75.0%, same size and speed. It is narrate.py's
+   default model; Bi's blind listen against the published file is pending.
+8. **Many things didn't help**: CPU expert repacking, one graph per frame, op fusion, Vulkan driver switches, Q8_0
+   (5–6× slower), self-draft speculative decoding (about 5% acceptance), the shared expert on the GPU beside the CPU
+   experts, and a native CUDA build (no faster than Vulkan).
 
 | setup | RTFx | ready | RAM | GPU expert layers |
 |---|---|---|---|---|
@@ -45,6 +49,7 @@ low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voic
 | + fused decoder, Q4_K | 0.69 | | | 4 |
 | **+ freed VRAM and flash attention, Q4_K, one take** | **0.77** | | | 8 |
 | **+ four takes at once, Q4_K (throughput)** | **1.24–1.27** | about 25 s | | 0 |
+| + pinned handoff memory (same-day A/B, slower day) | 0.71 → 0.75 one take, 1.16 → 1.22 four | | | 6 / 0 |
 
 ## Step 1: baseline
 
@@ -296,15 +301,69 @@ before).
 | One submission per frame (`SPEECH_ONE_GRAPH=1`: decoder, embedding, text model and head in one scheduled graph) | Bit-identical, but 64.7 against 64.5 ms per frame. Graph launches were not the cost; the 73 scheduler splits a frame stay either way. |
 | Op fusion (`SPEECH_FUSE_OPS=1`: router in llama.cpp's node order for Vulkan's topk_moe kernel, swiglu as one node) | 53.2 against 52.8 ms. Fusing the router lost the sigmoid-mul and multi-add fusions, and the router was about 2% of GPU time. |
 
-### Native Windows CUDA build
+### Native Windows CUDA build and utilisation
 
-A native Windows CUDA build with the same patches and switches is no faster than Vulkan: one stream 0.773× against
-0.769×, four streams 1.19× against 1.24–1.27×. The two backends' kernels differ, but the speed hardly moves, so what
-remains is GPU idle time waiting on the CPU rather than kernel quality. Vulkan stays the default.
+A native Windows CUDA build (CUDA 13.3.1, sm_89, [`build_cuda.cmd`](scorecard/tools/build_cuda.cmd)) with the same patches and
+switches, 20 takes:
+
+| setup | Vulkan | CUDA |
+|---|---|---|
+| 1 stream, 8 GPU expert layers | 0.769× | 0.773× |
+| 3 streams | 1.20× | 1.10× |
+| 4 streams | 1.24–1.27× | 1.19× |
+
+NVIDIA's own kernels match Vulkan's, so kernel quality is not the limit, and Vulkan stays the default. With 4 streams the
+GPU is busy about 43% of the time and the CPU about 44% (of 16 logical threads; 8 are used): neither side saturates. Each
+take stops and starts at 36 GPU↔CPU handoffs a frame, and the CPU experts read about 0.5 GB of RAM a frame (about 14 GB/s
+at 4 streams). The remaining cost is GPU idle time waiting on the CPU. Batched multi-take decoding (one handoff per layer for
+every take) is the one large throughput lever left, estimated at about 1.5× with a RAM-bandwidth ceiling around 2×.
+
+### Pinned handoff memory and overlap
+
+Single take, 6 GPU expert layers, text-model time per frame, 2 alternating runs:
+
+| change | text ms/frame | takes | verdict |
+|---|---|---|---|
+| baseline | 51.1 / 51.4 | — | — |
+| `SPEECH_SCHED_PINNED=1`: the scheduler's CPU buffers in Vulkan pinned host memory | **48.2 / 48.2** | bit-identical | **adopted** |
+| `GGML_SCHED_EARLY=1`: the shared expert built after the router, and the device split's tail submitted once the CPU split has copied its inputs, so the GPU computes it beside the CPU experts | 52.1 / 52.3 | bit-identical | rejected: about 0.1 ms of GPU work per layer, less than an extra submit costs |
+
+A first version that ran the next device split's independent nodes ahead of the CPU split produced NaNs: running nodes out
+of the allocator's order lets later nodes reuse memory earlier ones still read. Only contiguous tails are safe.
+
+With pinned memory over 20 takes: one stream 0.712× → **0.752×**, four streams 1.157× → **1.217×** (+5%). These are same-day
+runs; that day the PC ran about 5% slower than the final sweep above, with 570 MB of desktop VRAM in use.
 
 The floor for a single take on this rig is about 60 ms per frame: CPU experts about 22 ms, GPU dispatches about 18 ms,
 copies about 10 ms, decoder about 9 ms, codec about 2.5 ms. Going lower needs a bigger GPU (more expert layers, fewer
 handoffs) or a change to the model's arithmetic.
+
+## English importance-matrix Q4_K
+
+`Drama-imx-q4k.gguf`: 20.8 GB, the same tensor types as the published Q4_K, with each matrix's rounding weighted by how much
+its input channels matter on English speech.
+
+- Collection (`SPEECH_IMATRIX_OUT`): an eval callback on every text-model MUL_MAT and MUL_MAT_ID of a `blk.*` weight sums
+  each input channel's squares, per expert for the stacked expert tensors.
+- Calibration ([`calib.py`](scorecard/tools/calib.py)): 119 English texts (the LibriSpeech subset and the scorecard sentences,
+  with the fidelity sentences held out), each with voice `none` and with the narrator voice. 238 runs, 15.8 M products,
+  all 520 text-model matrices, 255 of 256 experts per layer.
+- Quantising (`SPEECH_QUANT_IMATRIX`, from F16). The audio decoder, codec, `token_embd` and head are not weighted.
+
+KL against F16 on 6 held-out sentences (2 old, 4 new in [`fidelity-extra.txt`](scorecard/fidelity-extra.txt); 60 frames
+each; replayed on Vulkan):
+
+| file | main-token KL | main top-1 | codebook KL | codebook top-1 | main KL per sentence |
+|---|---|---|---|---|---|
+| published Q4_K | 0.0727 | 75.0% | 0.1559 | 53.1% | 0.068 0.056 0.097 0.056 0.107 0.053 |
+| **English imatrix Q4_K** | **0.0318** | **83.6%** | **0.1327** | **54.4%** | 0.036 0.028 0.040 0.029 0.035 0.023 |
+
+- −56% main-token KL, better on all 6 sentences, although the trajectories were generated by the published file, which
+  biases the test toward it. For scale, Q4_K → Q2_K cost +0.12 KL and was audible.
+- Speed and runaways are unchanged: 0 of 20 runaway takes, and the narrated cold open took 118 s against 116 s.
+- On the same reference set, the F16 KV cache costs 0.0003 and flash attention 0.0018 in main-token KL against F16.
+- Adopted as narrate.py's default model (`--model win\Drama-35B-A3B-v3-Q4_K.gguf` restores the published file).
+  **Bi's blind A/B against the published file is pending.**
 
 ## Expert prefetch from the router (`SPEECH_PREFETCH_EXPERTS`)
 
@@ -390,10 +449,11 @@ voice file with `speech voice`. It holds: ECAPA similarity to the reference is 0
 
 ## What it means, and what's next
 
-- Q4_K is the quality default and Q2_K the speed and low-RAM option.
+- The English-imatrix Q4_K is the default (pending Bi's listen), the published Q4_K the reference, and Q2_K the speed
+  and low-RAM option.
 - On an 8 GB card a single take is near its floor (0.77×). Throughput comes from running takes side by side, which
   suits narration, since several takes per line are wanted anyway.
 - Use the mmap loader when RAM is short; fread is steadier when other apps press on memory on Windows.
-- Next: in-between expert mixes (IQ4_XS, Q2_K on only some layers, an imatrix) to find where speed stops costing
-  intonation, judged by KL first and then by ear; KL on more sentences; cutting the GPU's wait on the CPU, which
-  the CUDA comparison points to as the remaining cost.
+- Next: Bi's blind listen of the imatrix Q4_K; batched multi-take decoding (one handoff per layer for every take), the
+  remaining throughput lever; imatrix versions of the smaller expert mixes (IQ4_XS, Q2_K on some layers), judged by KL
+  first and then by ear.

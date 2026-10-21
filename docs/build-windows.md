@@ -52,7 +52,7 @@ build-vk\speech.exe tts Drama-35B-A3B-v3-Q4_K.gguf --voice none -o hello.wav "He
 Shut WSL down first if it is running: its VM holds RAM the model wants. Close other GPU apps too, or lower
 `SPEECH_GPU_EXPERT_LAYERS_EXACT`: if the expert layers overcommit VRAM, Windows pages buffers out and speed halves.
 Use 8 layers when nothing else holds VRAM. For several takes at once, run `speech worker` with `SPEECH_STREAMS=4`,
-`SPEECH_GPU_EXPERT_LAYERS_EXACT=0` and `--threads 2`, and submit the takes together.
+`SPEECH_GPU_EXPERT_LAYERS_EXACT=0` and `--threads 2`, and submit the takes together. `SPEECH_SCHED_PINNED=1` adds about 5%.
 
 [`narrate.cmd`](../narrate.cmd) wraps all of this for a text file: one segment per line, several takes per segment
 generated four at a time, and a stitched `narration.wav` of the first usable take of each.
