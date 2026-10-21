@@ -10,10 +10,12 @@ automatic MOS predictor (1–5).
 
 ## Summary
 
-**Best setup on this PC: native Windows Vulkan with an English-imatrix Q4_K, the fused audio decoder, half-precision
+**Best setup on this PC: native Windows Vulkan with an English-imatrix mixed-precision file ("imx2-mix": routed experts
+Q4_K, everything else Q6_K or Q8_0, 21.8 GB), the fused audio decoder, half-precision
 caches sized for a line, `token_embd` on the CPU, flash attention and pinned handoff memory.** One take runs at **0.77× realtime** with 8 layers' experts
 on the GPU (stock under WSL: 0.44×). Four takes side by side, every expert on the CPU, give **1.24–1.27× realtime
-throughput**. [`narrate.cmd`](narrate.cmd) uses the four-stream setup by default. Q2_K experts remain the
+throughput** (1.25× with the mixed file, peaking at 7.4 of 8 GB VRAM; `--streams 3` if other GPU apps are open).
+[`narrate.cmd`](narrate.cmd) uses the four-stream setup by default. Q2_K experts remain the
 low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voice found they flatten intonation.
 
 1. **mmap loader: worker ready in seconds, not minutes, at a fraction of the RAM.** 8.6 s warm / 57 s cold against
@@ -32,9 +34,11 @@ low-RAM option (0.70× at 7.4 GB), but a second listening test with a fixed voic
    subset to prune or pin.
 6. **Several takes at once was held back by VRAM, not by the GPU.** Freeing 1.6 GB per stream (F16 cache, caches sized
    for a line, `token_embd` on the CPU) took two streams from 0.80× to 0.98× and made room for four (1.27×).
-7. **An English importance matrix halves Q4_K's error at no cost**: main-token KL from F16 0.032 against 0.073 for the
-   published Q4_K on 6 held-out sentences, top-token match 83.6% against 75.0%, same size and speed. It is narrate.py's
-   default model; Bi's blind listen against the published file is pending.
+7. **An English importance matrix plus Q6_K outside the experts cuts the error to a fraction at no speed cost.** Against
+   F16 on 6 held-out sentences, the imx2-mix file has main-token KL 0.027 against 0.073 for the published Q4_K (top-token
+   match 86.1% against 75.0%) and codebook KL 0.019 against 0.156 (match 83.2% against 53.1%), for +1 GB. The old
+   codebook "floor" was the audio decoder's Q4_K. It is narrate.py's default model; Bi's blind listen against the
+   published file is pending.
 8. **Many things didn't help**: CPU expert repacking, one graph per frame, op fusion, Vulkan driver switches, Q8_0
    (5–6× slower), self-draft speculative decoding (about 5% acceptance), the shared expert on the GPU beside the CPU
    experts, and a native CUDA build (no faster than Vulkan).
@@ -363,7 +367,34 @@ each; replayed on Vulkan):
 - Speed and runaways are unchanged: 0 of 20 runaway takes, and the narrated cold open took 118 s against 116 s.
 - On the same reference set, the F16 KV cache costs 0.0003 and flash attention 0.0018 in main-token KL against F16.
 - Adopted as narrate.py's default model (`--model win\Drama-35B-A3B-v3-Q4_K.gguf` restores the published file).
-  **Bi's blind A/B against the published file is pending.**
+  It was later replaced as the default by the round 2 file below.
+
+### Round 2: the audio decoder, and mixed precision
+
+- The collector now also covers graphs off the scheduler (the audio decoder and the head; `Graph::compute_again` runs a
+  product at a time while collecting): 647 matrices against 520. Same 238 calibration runs (19.6 M products).
+- Two files from F16 ([`imx2_quant.sh`](scorecard/tools/imx2_quant.sh)): `Drama-imx2-q4k.gguf`, all Q4_K, and
+  `Drama-imx2-mix.gguf` with `SPEECH_QUANT_RULES="_exps=q4_K,token_embd=q8_0,output=q8_0,blk.=q6_K,ad.=q6_K"`: routed
+  experts Q4_K; attention, Gated DeltaNet, shared experts and the audio decoder Q6_K; embedding and head Q8_0.
+
+KL against F16, the same 6 held-out sentences:
+
+| file | size | main KL | main top-1 | codebook KL | codebook top-1 | main KL per sentence |
+|---|---|---|---|---|---|---|
+| published Q4_K | 20.8 GB | 0.0727 | 75.0% | 0.1559 | 53.1% | 0.068 0.056 0.097 0.056 0.107 0.053 |
+| imatrix, text model only | 20.8 GB | 0.0318 | 83.6% | 0.1327 | 54.4% | 0.036 0.028 0.040 0.029 0.035 0.023 |
+| imatrix with decoder, all Q4_K | 20.8 GB | 0.0301 | 81.4% | 0.1134 | 58.2% | 0.032 0.030 0.035 0.027 0.035 0.021 |
+| **imatrix with decoder, mixed (imx2-mix)** | **21.8 GB** | **0.0270** | **86.1%** | **0.0194** | **83.2%** | 0.017 0.015 0.015 0.030 0.073 0.012 |
+
+- **The codebook "floor" seen in the quant comparison was the audio decoder's Q4_K, not backend noise.** At Q6_K the
+  codebook KL falls 8× and agreement with F16 rises from 53% to 83%. Calibration alone helped the decoder only modestly (−15%).
+- The main token improves again. One sentence (0.073) is an outlier against the others' 0.012–0.030.
+- Speed (narrate settings, 20 takes) is unchanged: one stream with 6 GPU expert layers 0.760× (imatrix Q4_K) against
+  0.752× (mix); 4 streams 1.222× against 1.249×; 3 streams 1.156× (mix).
+- VRAM is +0.7 GB: 4 streams peak at 7.39 of 8.19 GB (0.6 GB of it the desktop), and one stream with 6 layers takes 7.12 GB.
+- **Adopted as narrate.py's default model.** Single-take mode drops to 5 GPU expert layers for headroom; with other programs
+  on the GPU, use `--streams 3`. `--model win\Drama-35B-A3B-v3-Q4_K.gguf` restores the published file.
+- **Bi's blind A/B (the published Q4_K against imx2-mix) is pending.**
 
 ## Expert prefetch from the router (`SPEECH_PREFETCH_EXPERTS`)
 
@@ -449,11 +480,11 @@ voice file with `speech voice`. It holds: ECAPA similarity to the reference is 0
 
 ## What it means, and what's next
 
-- The English-imatrix Q4_K is the default (pending Bi's listen), the published Q4_K the reference, and Q2_K the speed
-  and low-RAM option.
+- The English-imatrix mixed file (imx2-mix) is the default (pending Bi's listen), the published Q4_K the reference, and
+  Q2_K experts the speed and low-RAM option.
 - On an 8 GB card a single take is near its floor (0.77×). Throughput comes from running takes side by side, which
   suits narration, since several takes per line are wanted anyway.
 - Use the mmap loader when RAM is short; fread is steadier when other apps press on memory on Windows.
-- Next: Bi's blind listen of the imatrix Q4_K; batched multi-take decoding (one handoff per layer for every take), the
+- Next: Bi's blind listen of imx2-mix against the published Q4_K; batched multi-take decoding (one handoff per layer for every take), the
   remaining throughput lever; imatrix versions of the smaller expert mixes (IQ4_XS, Q2_K on some layers), judged by KL
   first and then by ear.

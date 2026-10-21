@@ -6,13 +6,13 @@ The target use is offline narration: script in, audio file out. The project has 
 
 ## Where it stands
 
-**Best setup so far: native Windows Vulkan build of speech.cpp with our patches and an English-imatrix Q4_K. One take runs at 0.77× realtime, and four takes side by side give 1.24–1.27× realtime throughput** (stock under WSL: 0.44×, 287 s to start, 16 GB). Full numbers in [RESULTS.md](RESULTS.md).
+**Best setup so far: native Windows Vulkan build of speech.cpp with our patches and an English-imatrix mixed-precision file (routed experts Q4_K, the rest Q6_K/Q8_0, 21.8 GB). One take runs at 0.77× realtime, and four takes side by side give 1.24–1.27× realtime throughput** (stock under WSL: 0.44×, 287 s to start, 16 GB). Full numbers in [RESULTS.md](RESULTS.md).
 
 - **mmap loader**: startup in seconds instead of minutes, bit-identical output, and the model runs under a 16 GB RAM cap where the stock loader is OOM-killed.
 - **SSD streaming works**, and prefetching the router's chosen experts makes it 1.5–2.25× faster under a RAM cap.
 - **The speed limit is the GPU↔CPU handoff and small GPU dispatches**, so what helps is fitting more layers on the GPU and a cheaper handoff (native Windows rather than WSL).
 - **Fused audio decoder, freed VRAM and flash attention** took one Q4_K take from 0.65× to 0.77×. The VRAM savings (half-precision caches sized for a line, `token_embd` on the CPU) are also what made four concurrent takes fit.
-- **An English importance matrix** halves Q4_K's error against F16 (main-token KL 0.032 against 0.073 for the published file, top-token match 83.6% against 75.0%) at the same size and speed. It's the default model now; Bi's blind listen against the published file is pending.
+- **An English importance matrix, with Q6_K outside the experts**, cuts the error against F16 to a fraction at the same speed and +1 GB: main-token KL 0.027 against 0.073 for the published Q4_K (top-token match 86.1% against 75.0%), and codebook KL 0.019 against 0.156 (match 83.2% against 53.1%). It's the default model now. Four takes peak at 7.4 of 8 GB VRAM, so use `--streams 3` with other GPU apps open. Bi's blind listen against the published file is pending.
 - **Pinned host memory for the GPU↔CPU handoffs** adds about 5% (one take 0.71× → 0.75×, four 1.16× → 1.22× in same-day runs), with bit-identical audio.
 - **Q2_K experts** give 1.4× the speed at 55% of the RAM for about +0.6 WER points. A blind test with a fixed voice found they flatten intonation, so Q4_K is the quality default.
 - **Didn't help**: CPU expert repacking, Q8_0, self-draft speculative decoding, one GPU submission per frame, op fusion, next-layer pre-gating, hot-expert tiering, the shared expert on the GPU beside the CPU experts, and a native CUDA build in place of Vulkan (no faster, so kernels aren't the limit).
@@ -43,7 +43,7 @@ The target use is offline narration: script in, audio file out. The project has 
 | `scorecard/*.sh` | Experiment drivers: `exp_queue.sh` (threads, load, experts), `mmap_sweep.sh` / `ra_test.sh` (RAM cap, readahead), `pf_sweep.sh` (expert prefetch), `tier_runs.sh` / `ovh*_runs.sh` (hot-expert tiering, handoff overhead), `quant_fid.sh` / `quant_score.sh` (quants, KL), `bench.sh ja\|en` (public benchmarks). |
 | `scorecard/corpus*.jsonl` | Fixed text sets: 20 English sentences + 1 paragraph, a contrast set, speech-bench's Japanese prompts, a 100-utterance LibriSpeech test-clean subset. |
 | `scorecard/tp.py` | Throughput of a worker serving several takes at once (`SPEECH_STREAMS`). |
-| `scorecard/tools/calib.py`, `imx_quant.sh`, `kl_table.py` | Importance-matrix calibration, the imatrix quantise, and the KL table. `scorecard/fidelity-extra.txt` holds the extra held-out KL sentences. |
+| `scorecard/tools/calib.py`, `imx_quant.sh`, `imx2_quant.sh`, `kl_table.py` | Importance-matrix calibration, the imatrix quantises (round 2 makes the mixed default), and the KL table. `scorecard/fidelity-extra.txt` holds the extra held-out KL sentences. |
 | `scorecard/tools/` | Helpers: speed and step summaries, sweep stats, the listening-pack builders, the Windows build scripts (`build_win3.cmd` is current), the Windows benchmark drivers (`win_bench_*.ps1`) and the Vulkan profile summary (`vk_perf_sum.py`). |
 
 The scripts carry the paths of the rig they ran on (`/mnt/c/Users/...`, `~/drama3/...`, `~/models/...`); edit them for yours.
@@ -59,9 +59,9 @@ This repo holds patches, scripts and measurements only. It does not include the 
 5. **Quality check.** KL fidelity, two public benchmarks and two blind listening tests (the second with a fixed voice file): done. Q4_K is the quality default.
 6. **Q4_K speed.** Done: fused audio decoder, VRAM spill fix, freed VRAM, flash attention. 0.77× for one take.
 7. **Batch takes.** Done as concurrent streams: four takes at once give 1.24–1.27× realtime throughput.
-8. **Importance matrix.** Done for Q4_K: −56% KL at the same size. Listening test pending.
+8. **Importance matrix.** Done, covering the text model, audio decoder and head, with Q6_K/Q8_0 outside the experts: main KL −63%, codebook KL −88%. Listening test pending.
 
-Next: Bi's blind listen of the imatrix Q4_K; batched multi-take decoding (one handoff per layer for every take), the main throughput lever left; imatrix versions of the smaller expert mixes.
+Next: Bi's blind listen of the imatrix mix against the published Q4_K; batched multi-take decoding (one handoff per layer for every take), the main throughput lever left; imatrix versions of the smaller expert mixes.
 
 ## Licence note
 

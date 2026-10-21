@@ -55,7 +55,7 @@ Use 8 layers when nothing else holds VRAM. For several takes at once, run `speec
 `SPEECH_GPU_EXPERT_LAYERS_EXACT=0` and `--threads 2`, and submit the takes together. `SPEECH_SCHED_PINNED=1` adds about 5%.
 
 [`narrate.cmd`](../narrate.cmd) wraps all of this for a text file: one segment per line, several takes per segment
-generated four at a time, and a stitched `narration.wav` of the first usable take of each.
+generated four at a time (`--streams 3` with other GPU apps open), and a stitched `narration.wav` of the first usable take of each.
 
 ## Notes from getting it working
 
