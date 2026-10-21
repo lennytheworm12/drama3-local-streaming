@@ -6,7 +6,7 @@ Windows build is made from file for file.
 
 | Patch | Applies in | What |
 |---|---|---|
-| `speech.cpp-exp.diff` | the speech.cpp root | Every experiment: loaders, expert prefetch, mixed expert quants, the fused audio decoder, concurrent streams, the VRAM savings, flash attention, GPU-layer caps, pinned handoff memory, importance-matrix collection and quantising, and the measurement switches. 17 files (including the new `src/common/imatrix.{cpp,h}`), about 1,400 lines added. |
+| `speech.cpp-exp.diff` | the speech.cpp root | Every experiment: loaders, expert prefetch, mixed expert quants, the fused audio decoder, concurrent streams, the VRAM savings, flash attention, GPU-layer caps, pinned handoff memory, importance-matrix collection and quantising, and the measurement switches. 18 files (including the new `src/common/imatrix.{cpp,h}`), about 1,400 lines added. |
 | `ggml-experiments.diff` | the `ggml` submodule (at `a655cf6`) | Scheduler timing, split dumps and the rejected early-submit experiment (`ggml-backend.cpp`), and the CPU `mul_mat_id` skipping an expert id of -1, which only hot-expert tiering needs (`ggml-cpu.c`). |
 
 ```
@@ -21,7 +21,7 @@ until you set one. They are experiments, not upstream-ready code: they read the 
 
 ## What we run
 
-[`narrate.py`](../narrate.py) sets these for the best setup (the English-imatrix Q4_K, native Vulkan, 4 takes at once):
+[`narrate.py`](../narrate.py) sets these for the best setup (the English-imatrix mixed file, native Vulkan, 4 takes at once):
 
 ```
 SPEECH_FUSED_DECODER=1 SPEECH_KV_F16=1 SPEECH_MAX_PROMPT_ROWS=2048 SPEECH_MAX_FRAMES=1024
@@ -49,7 +49,7 @@ and 6 leaves headroom. `SPEECH_MIXED_OK=1` is needed to read the mixed-expert fi
 | `SPEECH_EMBD_ON_CPU=1` | the 0.3 GB `token_embd` in RAM, its row decoded on the CPU each frame | `drama3-engine.cpp`, `text-model.cpp` |
 | `SPEECH_FLASH_ATTN=1` | `ggml_flash_attn_ext` with the F16 cache, F32 accumulation (−5.5 ms a frame) | `attention.cpp` |
 | `SPEECH_SCHED_PINNED=1` | the scheduler's CPU buffers in Vulkan pinned host memory, so GPU↔CPU handoff copies are faster (bit-identical, −3 ms a frame) | `text-model.cpp` |
-| `SPEECH_IMATRIX_OUT=path`, `SPEECH_QUANT_IMATRIX=path` | importance matrix: an eval callback on every text-model MUL_MAT / MUL_MAT_ID accumulates each input channel's sum of squares (per expert for stacked experts) and saves it at exit; `speech quantize` then weights each matrix's rounding error by it | `src/common/imatrix.{cpp,h}`, `text-model.cpp`, `quantize.cpp`, `CMakeLists.txt` |
+| `SPEECH_IMATRIX_OUT=path`, `SPEECH_QUANT_IMATRIX=path` | importance matrix: an eval callback on every MUL_MAT / MUL_MAT_ID of the text model, audio decoder and head accumulates each input channel's sum of squares (per expert for stacked experts) and saves it at exit; `speech quantize` then weights each matrix's rounding error by it | `src/common/imatrix.{cpp,h}`, `src/common/graph.cpp`, `text-model.cpp`, `quantize.cpp`, `CMakeLists.txt` |
 | `SPEECH_GPU_EXPERT_LAYERS=n`, `SPEECH_GPU_EXPERT_LAYERS_EXACT=n` | cap, or set exactly, how many layers' experts go on the GPU. The cap fixes VRAM overcommit when other apps hold VRAM; the exact count is needed because the automatic estimate doesn't see the smaller caches. | `drama3-engine.cpp` |
 
 **Tried and rejected** (kept so the results can be reproduced)
@@ -76,15 +76,17 @@ and 6 leaves headroom. `SPEECH_MIXED_OK=1` is needed to read the mixed-expert fi
 | `SPEECH_RECORD`, `SPEECH_FORCE`, `SPEECH_LOGITS=path` | teacher-forced fidelity: record a trajectory, replay it on another build, dump logits | `synthesizer.cpp` |
 | `GGML_SCHED_TIMING=1`, `GGML_SCHED_SPLITS=n` | per-backend copy and compute time per split (synchronised after each split), and the splits of the first n graphs | ggml `src/ggml-backend.cpp` |
 
-## Making an English-imatrix Q4_K and a Q2_K-experts file from the published F16
+## Making the English-imatrix files and a Q2_K-experts file from the published F16
 
 ```
 SPEECH_IMATRIX_OUT=imatrix-en.simx python scorecard/tools/calib.py --binary speech --model MODEL.gguf --voice-file narrator.voice.gguf
 SPEECH_QUANT_FROM_F16=1 SPEECH_QUANT_IMATRIX=imatrix-en.simx speech quantize Drama-35B-A3B-v3-F16.gguf Drama-imx-q4k.gguf --type q4_k
+SPEECH_QUANT_FROM_F16=1 SPEECH_QUANT_IMATRIX=imatrix-en2.simx SPEECH_QUANT_RULES="_exps=q4_K,token_embd=q8_0,output=q8_0,blk.=q6_K,ad.=q6_K" \
+  speech quantize Drama-35B-A3B-v3-F16.gguf Drama-imx2-mix.gguf --type q4_k
 SPEECH_QUANT_FROM_F16=1 SPEECH_QUANT_RULES="_exps=q2_K" speech quantize Drama-35B-A3B-v3-F16.gguf Drama-exps-q2k.gguf --type q4_k
 SPEECH_MIXED_OK=1 speech tts Drama-exps-q2k.gguf --voice none -o hello.wav "Hello there."
 ```
 
-The imatrix file has the published file's types and size (20.8 GB); the matrix itself is 192 MB and not in this repo ([`imx_quant.sh`](../scorecard/tools/imx_quant.sh) is the script we ran). The Q2_K file has base type Q4_K, routed experts Q2_K and the router F32 (the layout requires it): 13.2 GB against 20.8 GB.
+`Drama-imx-q4k.gguf` has the published file's types and size (20.8 GB). `Drama-imx2-mix.gguf`, the default, uses the round 2 matrix (which also covers the audio decoder and head) and keeps everything but the routed experts at Q6_K, with the embedding and head at Q8_0: 21.8 GB. The matrices are about 190 MB each and not in this repo ([`imx_quant.sh`](../scorecard/tools/imx_quant.sh) and [`imx2_quant.sh`](../scorecard/tools/imx2_quant.sh) are the scripts we ran). The Q2_K file has base type Q4_K, routed experts Q2_K and the router F32 (the layout requires it): 13.2 GB against 20.8 GB.
 
 The native Windows build needs no source changes beyond these patches; see [`docs/build-windows.md`](../docs/build-windows.md).

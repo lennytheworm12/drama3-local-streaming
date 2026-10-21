@@ -25,9 +25,46 @@ index 5e5476c..02436f4 100644
          spend(*request, run, [&] {
              if (!run.stopped()) result->stop = request->model->engine->speak(*request->text, values, run);
          });
+diff --git a/src/common/graph.cpp b/src/common/graph.cpp
+index 03c7ccb..a88fc78 100644
+--- a/src/common/graph.cpp
++++ b/src/common/graph.cpp
+@@ -1,5 +1,7 @@
+ #include "graph.h"
+ 
++#include "imatrix.h"
++
+ #include <cstring>
+ #include <functional>
+ #include <stdexcept>
+@@ -132,6 +134,24 @@ void Graph::set(ggml_tensor * input, const std::vector<int32_t> & data) {
+ 
+ void Graph::compute_again(ggml_backend_t backend) {
+     for (const Upload & u : uploads_) ggml_backend_tensor_set(u.tensor, u.bytes.data(), 0, u.bytes.size());
++    if (imatrix_collecting()) {
++        // Experiment (SPEECH_IMATRIX_OUT): graphs off the scheduler (the audio decoder's, the head's) run a product at
++        // a time so the collector sees each one's input, as the scheduler's eval callback does for the text model.
++        for (int j0 = 0; j0 < ggml_graph_n_nodes(gf_);) {
++            int j1 = j0;
++            while (j1 + 1 < ggml_graph_n_nodes(gf_) && !imatrix_collect(ggml_graph_node(gf_, j1), true, nullptr)) j1++;
++            ggml_init_params params = {ggml_graph_overhead_custom(j1 - j0 + 1, false), nullptr, true};
++            ggml_context * vc = ggml_init(params);
++            ggml_cgraph * view = ggml_new_graph_custom(vc, j1 - j0 + 1, false);
++            for (int j = j0; j <= j1; j++) ggml_graph_add_node(view, ggml_graph_node(gf_, j));
++            compute_graph(backend, view);
++            ggml_free(vc);
++            ggml_tensor * t = ggml_graph_node(gf_, j1);
++            if (imatrix_collect(t, true, nullptr)) imatrix_collect(t, false, nullptr);
++            j0 = j1 + 1;
++        }
++        return;
++    }
+     compute_graph(backend, gf_);
+ }
+ 
 diff --git a/src/common/imatrix.cpp b/src/common/imatrix.cpp
 new file mode 100755
-index 0000000..beac265
+index 0000000..bf296e9
 --- /dev/null
 +++ b/src/common/imatrix.cpp
 @@ -0,0 +1,193 @@
@@ -176,7 +213,7 @@ index 0000000..beac265
 +    const bool product = t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID;
 +    const ggml_tensor * w = product ? t->src[0] : nullptr;
 +    // Only the file's weights: named, and not the intermediate products of attention.
-+    const bool weight = w && std::strncmp(w->name, "blk.", 4) == 0 && w->op == GGML_OP_NONE;
++    const bool weight = w && (std::strncmp(w->name, "blk.", 4) == 0 || std::strncmp(w->name, "ad.", 3) == 0 || std::strcmp(w->name, "output") == 0) && w->op == GGML_OP_NONE;
 +    if (ask) return weight;
 +    if (!weight) return true;
 +    const ggml_tensor * x = t->src[1];

@@ -34,10 +34,12 @@ def main():
     ap.add_argument("--voice", default="none", help="'none', or the name given with --voice-file")
     ap.add_argument("--voice-file", help="a voice file (.voice.gguf) made with `speech voice`")
     # Q4_K: in Bi's blind round 2 it was preferred (69% against 44% "would watch"), and Q2_K's takes drew the intonation
-    # complaints. The default is our Q4_K quantized from F16 with an English importance matrix (2026-10-20): the same size
-    # and speed as the published one, with less than half its KL from F16 on 6 held-out sentences (0.032 against 0.073).
+    # complaints. The default is our file quantized from F16 with an English importance matrix of the text model, the
+    # audio decoder and the head, routed experts Q4_K and everything else Q6_K or Q8_0 (2026-10-21): 1 GB larger and as
+    # fast as the published Q4_K, with KL from F16 on 6 held-out sentences of 0.027 against 0.073 for the main token and
+    # 0.019 against 0.156 for the codebooks (83% of codebook picks match F16's, against 53%).
     # Pass --model win\Drama-35B-A3B-v3-Q4_K.gguf for the published file, win\Drama-exps-q2k.gguf for faster drafts.
-    ap.add_argument("--model", default=os.path.join(HERE, "win", "Drama-imx-q4k.gguf"))
+    ap.add_argument("--model", default=os.path.join(HERE, "win", "Drama-imx2-mix.gguf"))
     ap.add_argument("--binary", default=os.path.join(HERE, "src", "speech.cpp-exp", "build-vk3", "speech.exe"))
     ap.add_argument("--out")
     a = ap.parse_args()
@@ -67,10 +69,11 @@ def main():
     # Several takes at once, one's CPU experts beside another's GPU layers: 4 streams of 2 threads gave 1.24-1.27x
     # realtime throughput, 3 streams 1.14-1.20x, 2 streams 1.08x, one stream 0.77x with 8 layers' experts on the GPU.
     # Each stream's caches take device memory, so with several every layer's experts stay with the CPU; a single
-    # stream holds 6 layers' (7.2 GB with 8 overcommits the card once other programs take some).
+    # stream holds 5 layers' (about 6.7 GB with the mixed file; more overcommits the card once other programs take some).
+    # Four streams of the mixed file peak at 7.4 GB of the card's 8; with other programs holding VRAM, use --streams 3.
     streams = a.streams
     os.environ.setdefault("SPEECH_STREAMS", str(streams))
-    os.environ.setdefault("SPEECH_GPU_EXPERT_LAYERS_EXACT", "0" if streams > 1 else "6")
+    os.environ.setdefault("SPEECH_GPU_EXPERT_LAYERS_EXACT", "0" if streams > 1 else "5")
     args, voice = [], a.voice
     if streams > 1:
         args += ["--threads", str(max(2, 8 // streams))]
